@@ -1,3 +1,4 @@
+# ========================= main.py =========================
 import os
 import json
 import requests
@@ -9,112 +10,166 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 from route import solve_route
 
-# 1. SETUP
+# ==========================================================
+# ENV SETUP
+# ==========================================================
 load_dotenv()
+
 ORS_API_KEY = os.getenv("ORS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is missing")
+if not ORS_API_KEY or not GEMINI_API_KEY:
+    raise RuntimeError("Missing API keys")
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash')
+model = genai.GenerativeModel("gemini-2.5-flash")
 
-app = FastAPI(title="AI Logistics Optimizer")
+# ==========================================================
+# FASTAPI APP
+# ==========================================================
+app = FastAPI(title="AI Logistics Route Optimizer")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. UPDATED DATA MODELS
+# ==========================================================
+# MODELS
+# ==========================================================
 class LogisticsQuery(BaseModel):
-    request_text: str 
+    request_text: str
 
 class LocationPoint(BaseModel):
     name: str
     lat: float
     lon: float
-    visit_sequence: int 
+    visit_sequence: int
 
 class RouteResponse(BaseModel):
     parsed_locations: List[LocationPoint]
 
-# 3. HELPER: GEOCODING 
-def get_coords_from_ors(location_name: str):
+# ==========================================================
+# GEOCODING
+# ==========================================================
+def geocode_city(city: str):
     try:
-        url = f"https://api.openrouteservice.org/geocode/search?api_key={ORS_API_KEY}&text={location_name}"
-        r = requests.get(url)
-        if r.status_code == 200:
-            data = r.json()
-            if data['features']:
-                coords = data['features'][0]['geometry']['coordinates']
-                return coords[1], coords[0] # lat, lon
+        r = requests.get(
+            "https://api.openrouteservice.org/geocode/search",
+            params={"api_key": ORS_API_KEY, "text": city},
+            timeout=10
+        )
+        if r.status_code == 200 and r.json().get("features"):
+            lon, lat = r.json()["features"][0]["geometry"]["coordinates"]
+            return lat, lon
     except Exception as e:
-        print(f"Geocoding error: {e}")
+        print(f"Geocoding failed for {city}: {e}")
     return None, None
 
-# 4. CORE AI LOGIC: SEQUENCE EXTRACTION
+# ==========================================================
+# LLM PARSING
+# ==========================================================
 def parse_logistics_intent(text: str):
     prompt = f"""
-    You are a Logistics Dispatcher. Analyze this request: "{text}"
-    
-    Task:
-    1. Identify all locations.
-    2. Determine the VISITING ORDER / SEQUENCE.
-       - Source City: Always assign visit_sequence = 1.
-       - Fixed Destination (e.g. "end at Mumbai"): Assign highest sequence (e.g., 10).
-       - Intermediate Stops:
-         * If the user says "then", "after", "first", "second": Assign increasing sequence numbers (2, 3, 4...).
-         * If the user just lists cities ("visit A, B, and C"): Assign the SAME sequence number to all of them (e.g., all are 2).
-    
-    Return a raw JSON array. Each object must have:
-    - "location_name": str
-    - "visit_sequence": int (1-based index)
-    
-    Do not use markdown. Return only JSON.
-    """
-    
+Extract logistics routing intent.
+
+Return ONLY a valid JSON array.
+Each object MUST have:
+- location_name (string)
+- visit_sequence (integer)
+
+Rules:
+- Start city → visit_sequence = 1
+- Ordered cities → increasing numbers
+- Unordered → same number
+- End city → highest number
+
+User query:
+{text}
+"""
+
     try:
-        response = model.generate_content(prompt)
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
+        res = model.generate_content(prompt)
+
+        if not getattr(res, "text", None):
+            return []
+
+        raw = res.text.strip()
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "").replace("```", "").strip()
+
+        data = json.loads(raw)
+        normalized = []
+
+        for item in data:
+            location = item.get("location_name") or item.get("city") or item.get("name")
+            visit_sequence = item.get("visit_sequence") or item.get("order")
+
+            if location is None or visit_sequence is None:
+                continue
+
+            normalized.append({
+                "location_name": str(location),
+                "visit_sequence": int(visit_sequence)
+            })
+
+        return normalized
+
     except Exception as e:
-        print(f"LLM Parsing failed: {e}")
+        print("LLM parse failed")
+        print("ERROR:", e)
         return []
 
+# ==========================================================
+# API ENDPOINTS
+# ==========================================================
 @app.post("/extract-sequence", response_model=RouteResponse)
 async def extract_sequence(query: LogisticsQuery):
-    extracted_data = parse_logistics_intent(query.request_text)
-    
-    if not extracted_data:
-        raise HTTPException(status_code=400, detail="No locations found in text.")
+    parsed = parse_logistics_intent(query.request_text)
 
-    final_locations = []
-    
-    for item in extracted_data:
-        lat, lon = get_coords_from_ors(item["location_name"])
-        
-        if lat and lon:
-            final_locations.append(LocationPoint(
-                name=item["location_name"],
-                lat=lat,
-                lon=lon,
-                visit_sequence=item.get("visit_sequence", 999),
-            ))
-            
-    final_locations.sort(key=lambda x: x.visit_sequence)
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to parse locations from text"
+        )
 
-    return RouteResponse(parsed_locations=final_locations)
+    locations = []
+    for p in parsed:
+        lat, lon = geocode_city(p["location_name"])
+        if lat is None or lon is None:
+            print(f"Skipping {p['location_name']} due to failed geocoding")
+            continue
+
+        locations.append(LocationPoint(
+            name=p["location_name"],
+            lat=lat,
+            lon=lon,
+            visit_sequence=p["visit_sequence"]
+        ))
+
+    if not locations:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid locations found after geocoding"
+        )
+
+    locations.sort(key=lambda x: x.visit_sequence)
+    return RouteResponse(parsed_locations=locations)
 
 @app.post("/optimize-route")
 async def optimize_route(data: RouteResponse):
-    """
-    Takes the output of /extract-sequence and runs the GA
-    """
-    locations_list = [loc.dict() for loc in data.parsed_locations]    
-    result = solve_route(locations_list)
+    if not data.parsed_locations:
+        raise HTTPException(
+            status_code=400,
+            detail="No locations provided for route optimization"
+        )
+
+    result = solve_route([loc.dict() for loc in data.parsed_locations])
+    # Ensure total distance and time are numbers or N/A
+    if "total_distance_km" not in result:
+        result["total_distance_km"] = "N/A"
+    if "total_duration_min" not in result:
+        result["total_duration_min"] = "N/A"
     return result

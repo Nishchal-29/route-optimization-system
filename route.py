@@ -1,237 +1,232 @@
+# ========================= route.py =========================
 import os
 import requests
 import random
-import json
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
+# ==========================================================
+# ENV
+# ==========================================================
 load_dotenv()
 ORS_API = os.getenv("ORS_API_KEY")
+WEATHER_API = os.getenv("WEATHER_API")
 
-# ======================================================================
-# CONFIGURATION
-# ======================================================================
+if not ORS_API:
+    raise RuntimeError("Missing ORS_API_KEY in .env")
+if not WEATHER_API:
+    print("Warning: WEATHER_API not found, weather windows will be skipped")
+
+# ==========================================================
+# GA CONFIG
+# ==========================================================
 POPULATION_SIZE = 60
 GENERATIONS = 200
-MUTATION_RATE = 0.20
-ALPHA = 1.0  # Weight for Distance
-BETA  = 1.0  # Weight for Duration
-SEQUENCE_PENALTY = 100000  # Massive penalty for breaking user order
+MUTATION_RATE = 0.2
 
-# ======================================================================
-# DATA FETCHING (MATRIX API)
-# ======================================================================
+ALPHA = 1.0
+BETA = 1.0
+PRIORITY_WEIGHT = 1000
+TIME_WINDOW_PENALTY = 1e7
+
+# ==========================================================
+# ORS MATRIX
+# ==========================================================
 def get_distance_matrix(locations):
-    """
-    locations: List of dicts [{'lat': x, 'lon': y}, ...]
-    Returns: distance_matrix, duration_matrix
-    """
-    coords = [[loc['lon'], loc['lat']] for loc in locations]
-    
-    url = "https://api.openrouteservice.org/v2/matrix/driving-car"
-    headers = {
-        "Authorization": ORS_API,
-        "Content-Type": "application/json"
-    }
-    body = {
-        "locations": coords,
-        "metrics": ["distance", "duration"]
-    }
-
+    coords = [[l["lon"], l["lat"]] for l in locations]
     try:
-        response = requests.post(url, json=body, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        return data["distances"], data["durations"]
+        r = requests.post(
+            "https://api.openrouteservice.org/v2/matrix/driving-car",
+            headers={"Authorization": ORS_API},
+            json={"locations": coords, "metrics": ["distance", "duration"]},
+            timeout=15
+        ).json()
+        return r.get("distances"), r.get("durations")
     except Exception as e:
-        print(f"Error fetching matrix: {e}")
-        return [], []
+        print("Error fetching distance matrix:", e)
+        n = len(locations)
+        return [[0]*n for _ in range(n)], [[0]*n for _ in range(n)]
 
-# ======================================================================
-# GENETIC ALGORITHM CORE
-# ======================================================================
+# ==========================================================
+# WEATHER WINDOWS
+# ==========================================================
+def build_forbidden_windows(locations):
+    forbidden = {}
+    if not WEATHER_API:
+        return forbidden
 
-def calculate_route_metrics(route, dist_matrix, dur_matrix):
-    """Calculates pure distance and time without penalties."""
-    total_dist = 0
-    total_time = 0
+    trip_start = datetime.utcnow()
+    for idx, loc in enumerate(locations):
+        try:
+            res = requests.get(
+                "https://api.openweathermap.org/data/2.5/forecast",
+                params={
+                    "lat": loc["lat"],
+                    "lon": loc["lon"],
+                    "appid": WEATHER_API,
+                    "units": "metric"
+                },
+                timeout=10
+            ).json()
+
+            for entry in res.get("list", []):
+                reasons = []
+                if entry.get("rain", {}).get("3h", 0) > 1:
+                    reasons.append("Heavy Rain")
+                if entry["wind"]["speed"] > 8:
+                    reasons.append("High Wind")
+                if entry.get("visibility", 10000) < 3000:
+                    reasons.append("Low Visibility")
+
+                if reasons:
+                    t = datetime.strptime(entry["dt_txt"], "%Y-%m-%d %H:%M:%S")
+                    sec = int((t - trip_start).total_seconds())
+                    forbidden[idx] = {
+                        "start": sec,
+                        "end": sec + 3 * 3600,
+                        "reasons": reasons
+                    }
+                    break
+        except Exception as e:
+            print(f"Weather API failed for {loc['name']}: {e}")
+    return forbidden
+
+# ==========================================================
+# COST + FITNESS
+# ==========================================================
+def route_distance(route, dist):
+    return sum(dist[route[i]][route[i+1]] for i in range(len(route)-1))
+
+def route_duration(route, dur):
+    return sum(dur[route[i]][route[i+1]] for i in range(len(route)-1))
+
+def priority_penalty(route, locations):
+    return sum(locations[c]["visit_sequence"] * i for i, c in enumerate(route))
+
+def violates_time_window(route, dur, windows):
+    time = 0
+    penalty = 0
+    violations = []
+
     for i in range(len(route)-1):
-        u, v = route[i], route[i+1]
-        total_dist += dist_matrix[u][v]
-        total_time += dur_matrix[u][v]
-    return total_dist, total_time
+        time += dur[route[i]][route[i+1]]
+        idx = route[i+1]
+        if idx in windows:
+            w = windows[idx]
+            if w["start"] <= time <= w["end"]:
+                penalty += w["end"] - time
+                violations.append({
+                    "city_index": idx,
+                    "arrival_time_sec": int(time),
+                    "reasons": w["reasons"]
+                })
+    return penalty, violations
 
-def check_sequence_violations(route, constraints):
-    """
-    Checks if the route violates the user's requested order.
-    
-    Rule:
-    If City A has Sequence X and City B has Sequence Y, and X < Y,
-    then City A MUST appear before City B in the route.
-    
-    If X == Y, their relative order does NOT matter (GA helps optimized).
-    """
-    violations = 0
-    
-    # Create a map: City Index -> Sequence Number
-    # Default to 0 if not found (though all should be mapped)
-    seq_map = {}
-    for i, meta in enumerate(constraints):
-        # We use the index in the original constraints list to map to the route
-        seq_map[i] = meta.get('visit_sequence', 2) 
+def cost(route, dist, dur, locations, windows):
+    return (
+        ALPHA * route_distance(route, dist)
+        + BETA * route_duration(route, dur)
+        + PRIORITY_WEIGHT * priority_penalty(route, locations)
+        + TIME_WINDOW_PENALTY * violates_time_window(route, dur, windows)[0]
+    )
 
-    # Iterate through every pair in the calculated route
-    # Route is a list of indices, e.g., [0, 3, 1, 2]
-    for i in range(len(route)):
-        for j in range(i + 1, len(route)):
-            city_a_idx = route[i]
-            city_b_idx = route[j]
-            
-            seq_a = seq_map.get(city_a_idx, 2)
-            seq_b = seq_map.get(city_b_idx, 2)
-            
-            # CASE: We are visiting A before B (because i < j)
-            # VIOLATION if: A is supposed to be visited AFTER B (Seq A > Seq B)
-            if seq_a > seq_b:
-                violations += 1
-                
-    return violations
+def fitness(route, dist, dur, locations, windows):
+    return 1 / (cost(route, dist, dur, locations, windows) + 1)
 
-def cost_function(route, dist_matrix, dur_matrix, location_metadata):
-    dist, time = calculate_route_metrics(route, dist_matrix, dur_matrix)
-    
-    # Base Cost
-    base_cost = (ALPHA * dist) + (BETA * time)
-    
-    # Penalty Cost
-    violations = check_sequence_violations(route, location_metadata)
-    penalty_cost = violations * SEQUENCE_PENALTY
-    
-    return base_cost + penalty_cost
-
-# -------------------------------
-# GA HELPERS
-# -------------------------------
-def create_initial_population(num_cities, source_index=0):
-    population = []
-    # Exclude source from shuffling
-    remaining = list(range(num_cities))
-    remaining.remove(source_index)
-
+# ==========================================================
+# GA OPERATORS
+# ==========================================================
+def create_initial_population(n):
+    pop = []
     for _ in range(POPULATION_SIZE):
-        random.shuffle(remaining)
-        individual = [source_index] + remaining[:]
-        population.append(individual)
-    return population
+        route = [0] + random.sample(range(1, n), n - 1)
+        pop.append(route)
+    return pop
 
-def tournament_selection(population, dist_mat, dur_mat, meta, k=3):
-    selected = random.sample(population, k)
-    # Select best based on minimized cost (including penalty)
-    selected.sort(key=lambda r: cost_function(r, dist_mat, dur_mat, meta))
+def tournament_selection(pop, dist, dur, locations, windows, k=3):
+    selected = random.sample(pop, k)
+    selected.sort(key=lambda r: cost(r, dist, dur, locations, windows))
     return selected[0]
 
 def crossover(parent1, parent2):
-    # Order Crossover (OX1) logic to preserve sequence traits
-    p1 = parent1[1:] # Skip fixed source
+    p1 = parent1[1:]
     p2 = parent2[1:]
     n = len(p1)
+
     a, b = sorted(random.sample(range(n), 2))
-    
-    child_p = [None] * n
-    child_p[a:b] = p1[a:b]
-    
-    fill_pos = b
-    for item in p2:
-        if item not in child_p:
-            if fill_pos >= n: fill_pos = 0
-            child_p[fill_pos] = item
-            fill_pos += 1
-            
-    return [parent1[0]] + child_p
+    child = [None] * n
+    child[a:b] = p1[a:b]
+
+    idx = b
+    for x in p2:
+        if x not in child:
+            if idx >= n:
+                idx = 0
+            child[idx] = x
+            idx += 1
+
+    return [0] + child
 
 def mutate(route):
     if random.random() < MUTATION_RATE:
-        # Swap two cities (excluding source at index 0)
-        idx_range = range(1, len(route))
-        if len(idx_range) >= 2:
-            a, b = random.sample(idx_range, 2)
-            route[a], route[b] = route[b], route[a]
+        i, j = random.sample(range(1, len(route)), 2)
+        route[i], route[j] = route[j], route[i]
     return route
 
-# ======================================================================
-# MAIN OPTIMIZER ENTRY POINT
-# ======================================================================
-def solve_route(locations_data):
-    """
-    Main function called by API.
-    locations_data: List of dicts containing 'lat', 'lon', 'visit_sequence', 'name'
-    """
-    print(f"Starting optimization for {len(locations_data)} locations...")
-    
-    # 1. Get Matrix
-    dist_matrix, dur_matrix = get_distance_matrix(locations_data)
-    if not dist_matrix:
-        return {"error": "Failed to fetch matrix from ORS"}
+# ==========================================================
+# MAIN SOLVER
+# ==========================================================
+def solve_route(locations):
+    if not locations:
+        return {"status": "error", "message": "No locations provided"}
 
-    # 2. Run GA
-    population = create_initial_population(len(locations_data), source_index=0)
-    
-    global_best_route = None
-    global_best_cost = float('inf')
+    dist, dur = get_distance_matrix(locations)
+    windows = build_forbidden_windows(locations)
 
-    # Evolution Loop
-    for gen in range(GENERATIONS):
+    population = create_initial_population(len(locations))
+    best = None
+    best_cost = float("inf")
+
+    for _ in range(GENERATIONS):
         new_pop = []
-        
-        # Elitism: Keep best 2
-        population.sort(key=lambda r: cost_function(r, dist_matrix, dur_matrix, locations_data))
-        new_pop.extend(population[:2])
-        
-        while len(new_pop) < POPULATION_SIZE:
-            p1 = tournament_selection(population, dist_matrix, dur_matrix, locations_data)
-            p2 = tournament_selection(population, dist_matrix, dur_matrix, locations_data)
-            child = crossover(p1, p2)
-            child = mutate(child)
-            new_pop.append(child)
-            
-        population = new_pop
-        
-        # Track Global Best
-        current_best = population[0] # Sorted above
-        current_cost = cost_function(current_best, dist_matrix, dur_matrix, locations_data)
-        
-        if current_cost < global_best_cost:
-            global_best_cost = current_cost
-            global_best_route = current_best
 
-    # 3. Format Output for API
-    final_dist, final_time = calculate_route_metrics(global_best_route, dist_matrix, dur_matrix)
-    violations = check_sequence_violations(global_best_route, locations_data)
-    
-    optimized_order = []
-    for city_idx in global_best_route:
-        loc = locations_data[city_idx]
-        optimized_order.append({
-            "name": loc["name"],
-            "lat": loc["lat"],
-            "lon": loc["lon"],
-            "original_sequence_req": loc.get("visit_sequence")
-        })
+        # Elitism
+        population.sort(key=lambda r: cost(r, dist, dur, locations, windows))
+        new_pop.extend(population[:2])
+
+        while len(new_pop) < POPULATION_SIZE:
+            p1 = tournament_selection(population, dist, dur, locations, windows)
+            p2 = tournament_selection(population, dist, dur, locations, windows)
+            child = mutate(crossover(p1, p2))
+            new_pop.append(child)
+
+        population = new_pop
+        current_best = population[0]
+        c_cost = cost(current_best, dist, dur, locations, windows)
+        if c_cost < best_cost:
+            best = current_best
+            best_cost = c_cost
+
+    _, violations = violates_time_window(best, dur, windows)
+
+    optimized_route = [
+        {
+            "order": i + 1,
+            "name": locations[c]["name"],
+            "lat": locations[c]["lat"],
+            "lon": locations[c]["lon"],
+            "visit_sequence": locations[c]["visit_sequence"]
+        }
+        for i, c in enumerate(best)
+    ]
+
+    total_distance = route_distance(best, dist)
+    total_duration = route_duration(best, dur)
 
     return {
         "status": "success",
-        "total_distance_km": round(final_dist / 1000, 2),
-        "total_duration_min": round(final_time / 60, 2),
-        "sequence_violations": violations,
-        "optimized_route": optimized_order
+        "optimized_route": optimized_route,
+        "time_window_violations": violations,
+        "total_distance_km": round(total_distance / 1000, 2) if total_distance else "N/A",
+        "total_duration_min": round(total_duration / 60, 2) if total_duration else "N/A"
     }
-
-# For testing manually
-if __name__ == "__main__":
-    test_data = [
-        {"name": "Delhi", "lat": 28.61, "lon": 77.20, "visit_sequence": 1},
-        {"name": "Bangalore", "lat": 12.97, "lon": 77.59, "visit_sequence": 2},
-        {"name": "Jaipur", "lat": 26.91, "lon": 75.78, "visit_sequence": 2}, 
-        {"name": "Mumbai", "lat": 19.07, "lon": 72.87, "visit_sequence": 2}
-    ]
-    result = solve_route(test_data)
-    print(json.dumps(result, indent=2))
