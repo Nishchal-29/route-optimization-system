@@ -315,4 +315,4 @@ for v in violations:
     )
 
 print("\nFinal Distance:", route_distance(best_route,distance_matrix)/1000, "km")
-print("Final Duration:", route_duration(best_route,duration_matrix)/3600, "hours")
+print("Final Duration:", route_duration(best_route,duration_matrix)/3600, "hours") 

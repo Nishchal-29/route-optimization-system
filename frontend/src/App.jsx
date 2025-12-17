@@ -1,27 +1,34 @@
 import { useState } from 'react';
-import { Truck, MapPin, Sparkles, Clock, Route, AlertCircle } from 'lucide-react';
+import { Truck, MapPin, Sparkles, Clock, Route } from 'lucide-react';
+
 import QueryInput from './components/QueryInput';
 import LocationsDisplay from './components/LocationsDisplay';
 import RouteVisualization from './components/RouteVisualization';
 import OptimizationResults from './components/OptimizationResults';
 import LoadingState from './components/LoadingState';
 import ErrorDisplay from './components/ErrorDisplay';
-import { processLogisticsRequest } from './services/api';
+import MapSelectionModal from './components/MapSelectionModal';
+
+import { processLogisticsRequest, optimizeRoute } from './services/api';
 
 function App() {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+
   const [extractedLocations, setExtractedLocations] = useState(null);
   const [optimizationResult, setOptimizationResult] = useState(null);
-  const [stage, setStage] = useState('input'); // input, processing, results
 
-  // Example queries
+  const [stage, setStage] = useState('input'); // input | processing | results
+  const [showMap, setShowMap] = useState(false);
+
   const exampleQueries = [
     "Start from Delhi, visit Mumbai, Bangalore, and Chennai, then end at Kolkata",
     "I want to travel from delhi to deliver order at pune, jodhpur, banglore, mumbai and jaipur",
     "Begin at Pune, then go to Hyderabad, after that Jaipur, and finally return to Pune",
   ];
+
+  /* ---------------- TEXT BASED FLOW ---------------- */
 
   const handleSubmit = async () => {
     if (!query.trim()) {
@@ -37,14 +44,40 @@ function App() {
 
     try {
       const result = await processLogisticsRequest(query);
-      
+
       setExtractedLocations(result.extracted.parsed_locations);
       setOptimizationResult(result.optimized);
       setStage('results');
-      
-      console.log('Optimization Result:', result.optimized);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Something went wrong');
+      setStage('input');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /* ---------------- MAP BASED FLOW (CORRECT) ---------------- */
+
+  const handleMapOptimization = async (locations) => {
+    // 1️⃣ Close map immediately
+    setShowMap(false);
+
+    // 2️⃣ Trigger loading UI
+    setLoading(true);
+    setError(null);
+    setStage('processing');
+    setExtractedLocations(null);
+    setOptimizationResult(null);
+
+    try {
+      // 3️⃣ Call SAME optimize endpoint
+      const optimized = await optimizeRoute(locations);
+
+      setExtractedLocations(locations);
+      setOptimizationResult(optimized);
+      setStage('results');
+    } catch (err) {
+      setError(err.message || 'Route optimization failed');
       setStage('input');
     } finally {
       setLoading(false);
@@ -59,13 +92,9 @@ function App() {
     setStage('input');
   };
 
-  const handleExampleClick = (example) => {
-    setQuery(example);
-  };
-
   return (
     <div className="min-h-screen pb-20">
-      {/* Header */}
+      {/* ---------------- HEADER ---------------- */}
       <header className="bg-gradient-to-r from-primary-600 to-secondary-500 text-white shadow-2xl">
         <div className="container mx-auto px-6 py-8">
           <div className="flex items-center justify-between">
@@ -80,6 +109,7 @@ function App() {
                 </p>
               </div>
             </div>
+
             <div className="hidden md:flex items-center gap-6 text-sm">
               <div className="flex items-center gap-2">
                 <Sparkles className="w-5 h-5" />
@@ -94,68 +124,61 @@ function App() {
         </div>
       </header>
 
+      {/* ---------------- MAIN ---------------- */}
       <div className="container mx-auto px-6 py-8">
-        {/* Main Content Area */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Left Panel - Input & Controls */}
-          <div className="lg:col-span-1 space-y-6">
+
+          {/* -------- LEFT PANEL -------- */}
+          <div className="space-y-6">
             <QueryInput
               query={query}
               setQuery={setQuery}
               onSubmit={handleSubmit}
+              onSelectFromMap={() => setShowMap(true)}
               loading={loading}
-              disabled={loading}
             />
 
-            {/* Example Queries */}
             {stage === 'input' && (
               <div className="card">
-                <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                <h3 className="font-semibold mb-4 flex items-center gap-2">
                   <MapPin className="w-5 h-5 text-primary-500" />
                   Example Queries
                 </h3>
-                <div className="space-y-2">
-                  {exampleQueries.map((example, idx) => (
-                    <button
-                      key={idx}
-                      onClick={() => handleExampleClick(example)}
-                      className="w-full text-left p-3 bg-gray-50 hover:bg-primary-50 rounded-lg text-sm transition-colors duration-200 border border-transparent hover:border-primary-200"
-                    >
-                      {example}
-                    </button>
-                  ))}
-                </div>
+
+                {exampleQueries.map((ex, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setQuery(ex)}
+                    className="w-full text-left p-3 mb-2 bg-gray-50 rounded-lg hover:bg-primary-50"
+                  >
+                    {ex}
+                  </button>
+                ))}
               </div>
             )}
 
-            {/* Locations Display - Pass optimizationResult */}
             {extractedLocations && (
-              <LocationsDisplay 
-                locations={extractedLocations} 
+              <LocationsDisplay
+                locations={extractedLocations}
                 optimizedRoute={optimizationResult}
               />
             )}
 
-            {/* Reset Button */}
             {stage === 'results' && (
-              <button
-                onClick={handleReset}
-                className="btn-secondary w-full"
-              >
+              <button onClick={handleReset} className="btn-secondary w-full">
                 Start New Request
               </button>
             )}
           </div>
 
-          {/* Right Panel - Visualization & Results */}
+          {/* -------- RIGHT PANEL -------- */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Error Display */}
-            {error && <ErrorDisplay error={error} onDismiss={() => setError(null)} />}
+            {error && (
+              <ErrorDisplay error={error} onDismiss={() => setError(null)} />
+            )}
 
-            {/* Loading State */}
             {loading && <LoadingState />}
 
-            {/* Results */}
             {stage === 'results' && !loading && (
               <>
                 <OptimizationResults result={optimizationResult} />
@@ -166,65 +189,43 @@ function App() {
               </>
             )}
 
-            {/* Initial State */}
-            {stage === 'input' && !loading && !error && (
+            {stage === 'input' && !loading && (
               <div className="card text-center py-20">
-                <div className="w-24 h-24 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-6">
-                  <Route className="w-12 h-12 text-primary-500" />
-                </div>
-                <h2 className="text-2xl font-bold text-gray-800 mb-3">
-                  Welcome to AI Logistics Optimizer
+                <Route className="w-16 h-16 mx-auto text-primary-500 mb-4" />
+                <h2 className="text-2xl font-bold mb-2">
+                  Smart Logistics Routing
                 </h2>
-                <p className="text-gray-600 max-w-md mx-auto mb-6">
-                  Enter your delivery request in natural language and let our AI 
-                  find the most efficient route for you.
+                <p className="text-gray-600">
+                  Enter a request or select cities directly from the map.
                 </p>
-                <div className="flex items-center justify-center gap-4 text-sm text-gray-500">
-                  <div className="flex items-center gap-2">
-                    <Sparkles className="w-4 h-4" />
-                    <span>AI-Powered Parsing</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Clock className="w-4 h-4" />
-                    <span>Real-time Optimization</span>
-                  </div>
-                </div>
               </div>
             )}
           </div>
         </div>
 
-        {/* Info Cards */}
+        {/* -------- INFO CARDS -------- */}
         <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="card text-center">
-            <div className="w-12 h-12 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <Sparkles className="w-6 h-6 text-primary-500" />
+          {[
+            { icon: Sparkles, title: "AI Parsing", text: "Understands natural language" },
+            { icon: Route, title: "Genetic Optimization", text: "Finds best possible route" },
+            { icon: Clock, title: "Fast Results", text: "Near real-time computation" },
+          ].map((item, i) => (
+            <div key={i} className="card text-center">
+              <item.icon className="w-10 h-10 mx-auto text-primary-500 mb-3" />
+              <h3 className="font-semibold">{item.title}</h3>
+              <p className="text-sm text-gray-600">{item.text}</p>
             </div>
-            <h3 className="font-semibold text-lg mb-2">AI Understanding</h3>
-            <p className="text-gray-600 text-sm">
-              Our AI understands natural language and extracts locations with proper sequencing
-            </p>
-          </div>
-          <div className="card text-center">
-            <div className="w-12 h-12 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <Route className="w-6 h-6 text-primary-500" />
-            </div>
-            <h3 className="font-semibold text-lg mb-2">Smart Routing</h3>
-            <p className="text-gray-600 text-sm">
-              Genetic algorithm optimizes your route for minimum distance and time
-            </p>
-          </div>
-          <div className="card text-center">
-            <div className="w-12 h-12 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <Clock className="w-6 h-6 text-primary-500" />
-            </div>
-            <h3 className="font-semibold text-lg mb-2">Real-time Results</h3>
-            <p className="text-gray-600 text-sm">
-              Get instant route optimization with detailed distance and time estimates
-            </p>
-          </div>
+          ))}
         </div>
       </div>
+
+      {/* ---------------- MAP MODAL ---------------- */}
+      {showMap && (
+        <MapSelectionModal
+          onClose={() => setShowMap(false)}
+          onOptimize={handleMapOptimization}
+        />
+      )}
     </div>
   );
 }
