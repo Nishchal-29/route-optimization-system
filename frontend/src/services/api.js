@@ -60,26 +60,30 @@ api.interceptors.response.use(
 ===================================================== */
 
 /**
- * Extract locations & order from natural language
+ * Extract locations & visit order from natural language
  */
 export const extractSequence = async (requestText) => {
   const response = await api.post("/extract-sequence", {
     request_text: requestText,
   });
+
   return response.data;
 };
 
 /**
- * Optimize route (shared by NLP + MAP)
+ * Optimize route (used by NLP + MAP)
  */
 export const optimizeRoute = async (parsedLocations) => {
+  if (!Array.isArray(parsedLocations) || parsedLocations.length < 2) {
+    throw new Error("At least two locations are required.");
+  }
+
   const payload = {
     parsed_locations: parsedLocations.map((loc, index) => ({
       name: loc.name,
       lat: loc.lat,
       lon: loc.lon,
-      visit_sequence:
-        loc.visit_sequence ?? index + 1, // 👈 ensure sequence
+      visit_sequence: loc.visit_sequence ?? index + 1,
     })),
   };
 
@@ -94,7 +98,7 @@ export const processLogisticsRequest = async (requestText) => {
   const extracted = await extractSequence(requestText);
 
   if (
-    !extracted.parsed_locations ||
+    !extracted?.parsed_locations ||
     extracted.parsed_locations.length < 2
   ) {
     throw new Error("At least two locations are required.");
@@ -111,7 +115,7 @@ export const processLogisticsRequest = async (requestText) => {
 };
 
 /* =====================================================
-   MAP FLOW (USES SAME OPTIMIZER)
+   MAP FLOW
 ===================================================== */
 
 /**
@@ -119,7 +123,7 @@ export const processLogisticsRequest = async (requestText) => {
  * @param [{ name, lat, lon }]
  */
 export const optimizeFromMap = async (locations) => {
-  if (!locations || locations.length < 2) {
+  if (!Array.isArray(locations) || locations.length < 2) {
     throw new Error("Select at least two locations.");
   }
 
@@ -131,6 +135,37 @@ export const optimizeFromMap = async (locations) => {
   }));
 
   return optimizeRoute(enrichedLocations);
+};
+
+/* =====================================================
+   CHAT / EXPLANATION FLOW 🧠🤖
+===================================================== */
+
+/**
+ * Send message to LogiBOT
+ * Used for:
+ * - Route explanation
+ * - Traffic / weather reasoning
+ * - Summary generation
+ * - User requested modifications
+ */
+export const sendChatMessage = async (message, context) => {
+  if (!message || typeof message !== "string") {
+    throw new Error("Chat message must be a non-empty string.");
+  }
+
+  // 🔐 Guarantee valid JSON object (prevents 422)
+  const safeContext =
+    context && typeof context === "object" && !Array.isArray(context)
+      ? context
+      : {};
+
+  const response = await api.post("/chat", {
+    message,
+    context: safeContext,
+  });
+
+  return response.data;
 };
 
 /* =====================================================
