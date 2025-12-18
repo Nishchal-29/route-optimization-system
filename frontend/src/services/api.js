@@ -1,119 +1,183 @@
-import axios from 'axios';
+import axios from "axios";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+/* =====================================================
+   API INSTANCE
+===================================================== */
+
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const api = axios.create({
   baseURL: API_BASE_URL,
   headers: {
-    'Content-Type': 'application/json',
+    "Content-Type": "application/json",
   },
   timeout: 60000,
 });
 
-// Request interceptor for logging
+/* =====================================================
+   INTERCEPTORS
+===================================================== */
+
 api.interceptors.request.use(
   (config) => {
-    console.log('API Request:', config.method.toUpperCase(), config.url);
+    console.log(
+      "API Request:",
+      config.method?.toUpperCase(),
+      config.url,
+      config.data || ""
+    );
     return config;
   },
-  (error) => {
-    console.error('Request Error:', error);
-    return Promise.reject(error);
-  }
+  (error) => Promise.reject(error)
 );
 
-// Response interceptor for error handling
 api.interceptors.response.use(
   (response) => {
-    console.log('API Response:', response.status, response.config.url);
+    console.log(
+      "API Response:",
+      response.status,
+      response.config.url
+    );
     return response;
   },
   (error) => {
     if (error.response) {
-      console.error('Response Error:', error.response.status, error.response.data);
-    } else if (error.request) {
-      console.error('Network Error:', error.message);
+      console.error(
+        "API Error:",
+        error.response.status,
+        error.response.data
+      );
     } else {
-      console.error('Error:', error.message);
+      console.error("Network Error:", error.message);
     }
     return Promise.reject(error);
   }
 );
 
+/* =====================================================
+   NLP FLOW
+===================================================== */
+
 /**
- * Extract sequence from natural language query
- * @param {string} requestText - Natural language logistics request
- * @returns {Promise} - Parsed locations with coordinates and sequence
+ * Extract locations & visit order from natural language
  */
 export const extractSequence = async (requestText) => {
-  try {
-    const response = await api.post('/extract-sequence', {
-      request_text: requestText,
-    });
-    return response.data;
-  } catch (error) {
-    throw new Error(
-      error.response?.data?.detail || 
-      'Failed to extract locations from your request. Please try again.'
-    );
-  }
+  const response = await api.post("/extract-sequence", {
+    request_text: requestText,
+  });
+
+  return response.data;
 };
 
 /**
- * Optimize route using genetic algorithm
- * @param {Array} parsedLocations - Array of location objects with lat, lon, sequence
- * @returns {Promise} - Optimized route with distance, time, and sequence
+ * Optimize route (used by NLP + MAP)
  */
 export const optimizeRoute = async (parsedLocations) => {
-  try {
-    const response = await api.post('/optimize-route', {
-      parsed_locations: parsedLocations,
-    });
-    return response.data;
-  } catch (error) {
-    throw new Error(
-      error.response?.data?.detail || 
-      'Failed to optimize route. Please check your input and try again.'
-    );
+  if (!Array.isArray(parsedLocations) || parsedLocations.length < 2) {
+    throw new Error("At least two locations are required.");
   }
+
+  const payload = {
+    parsed_locations: parsedLocations.map((loc, index) => ({
+      name: loc.name,
+      lat: loc.lat,
+      lon: loc.lon,
+      visit_sequence: loc.visit_sequence ?? index + 1,
+    })),
+  };
+
+  const response = await api.post("/optimize-route", payload);
+  return response.data;
 };
 
 /**
- * Complete flow: Extract + Optimize
- * @param {string} requestText - Natural language logistics request
- * @returns {Promise} - Complete optimization result
+ * Full NLP pipeline
  */
 export const processLogisticsRequest = async (requestText) => {
-  try {
-    // Step 1: Extract sequence
-    const extractedData = await extractSequence(requestText);
-    
-    if (!extractedData.parsed_locations || extractedData.parsed_locations.length === 0) {
-      throw new Error('No locations found in your request. Please provide city names.');
-    }
-    
-    // Step 2: Optimize route
-    const optimizedRoute = await optimizeRoute(extractedData.parsed_locations);
-    
-    return {
-      extracted: extractedData,
-      optimized: optimizedRoute,
-    };
-  } catch (error) {
-    throw error;
+  const extracted = await extractSequence(requestText);
+
+  if (
+    !extracted?.parsed_locations ||
+    extracted.parsed_locations.length < 2
+  ) {
+    throw new Error("At least two locations are required.");
   }
+
+  const optimized = await optimizeRoute(
+    extracted.parsed_locations
+  );
+
+  return {
+    extracted,
+    optimized,
+  };
 };
 
+/* =====================================================
+   MAP FLOW
+===================================================== */
+
 /**
- * Health check endpoint
- * @returns {Promise} - API health status
+ * Optimize route from map-selected locations
+ * @param [{ name, lat, lon }]
  */
+export const optimizeFromMap = async (locations) => {
+  if (!Array.isArray(locations) || locations.length < 2) {
+    throw new Error("Select at least two locations.");
+  }
+
+  const enrichedLocations = locations.map((loc, index) => ({
+    name: loc.name,
+    lat: loc.lat,
+    lon: loc.lon,
+    visit_sequence: index + 1,
+  }));
+
+  return optimizeRoute(enrichedLocations);
+};
+
+/* =====================================================
+   CHAT / EXPLANATION FLOW 🧠🤖
+===================================================== */
+
+/**
+ * Send message to LogiBOT
+ * Used for:
+ * - Route explanation
+ * - Traffic / weather reasoning
+ * - Summary generation
+ * - User requested modifications
+ */
+export const sendChatMessage = async (message, context) => {
+  if (!message || typeof message !== "string") {
+    throw new Error("Chat message must be a non-empty string.");
+  }
+
+  // 🔐 Guarantee valid JSON object (prevents 422)
+  const safeContext =
+    context && typeof context === "object" && !Array.isArray(context)
+      ? context
+      : {};
+
+  const response = await api.post("/chat", {
+    message,
+    context: safeContext,
+  });
+
+  return response.data;
+};
+
+/* =====================================================
+   HEALTH CHECK
+===================================================== */
+
 export const healthCheck = async () => {
   try {
-    const response = await api.get('/health');
-    return response.data;
-  } catch (error) {
-    return { status: 'offline', error: error.message };
+    const res = await api.get("/health");
+    return res.data;
+  } catch {
+    return { status: "offline" };
   }
 };
 
