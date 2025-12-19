@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
-from route import solve_route
+from route import solve_route  # Your route optimization logic
 
 # ==========================================================
 # ENV SETUP
@@ -51,6 +51,10 @@ class LocationPoint(BaseModel):
 class RouteResponse(BaseModel):
     parsed_locations: List[LocationPoint]
 
+class ChatData(BaseModel):
+    message: str
+    context: dict = {}  
+
 # ==========================================================
 # GEOCODING
 # ==========================================================
@@ -89,7 +93,6 @@ Rules:
 User query:
 {text}
 """
-
     try:
         res = model.generate_content(prompt)
 
@@ -167,9 +170,83 @@ async def optimize_route(data: RouteResponse):
         )
 
     result = solve_route([loc.dict() for loc in data.parsed_locations])
-    # Ensure total distance and time are numbers or N/A
+
     if "total_distance_km" not in result:
         result["total_distance_km"] = "N/A"
     if "total_duration_min" not in result:
         result["total_duration_min"] = "N/A"
+
     return result
+
+@app.post("/chat")
+async def chat(data: ChatData):
+    if not data.message:
+        raise HTTPException(
+            status_code=400,
+            detail="No message provided."
+        )
+
+    # ---------------- CONTEXT HANDLING ----------------
+    context_block = "No route context available."
+
+    if isinstance(data.context, dict) and data.context:
+        try:
+            locations = data.context.get("locations", [])
+            optimized = data.context.get("optimizedRoute", {})
+
+            context_block = f"""
+ROUTE DATA:
+- Locations (in order):
+{json.dumps(locations, indent=2)}
+
+- Optimized Route Details:
+{json.dumps(optimized, indent=2)}
+"""
+        except Exception as e:
+            print("Context parsing failed:", e)
+            context_block = "Context was provided but could not be parsed."
+
+    # ---------------- PROMPT ----------------
+    prompt = f"""
+You are **LogiBOT**, an expert AI assistant for logistics route optimization.
+
+Your tasks:
+- Explain WHY the route was formed
+- Consider traffic, distance, sequencing, constraints
+- Answer clearly and practically
+- If user requests changes, explain what would change and why
+
+{context_block}
+
+USER QUESTION:
+{data.message}
+
+RULES:
+- Be concise but insightful
+- Use bullet points if helpful
+- Do NOT hallucinate missing data
+"""
+
+    # ---------------- LLM CALL ----------------
+    try:
+        res = model.generate_content(prompt)
+        reply_text = getattr(res, "text", None)
+
+        if not reply_text:
+            reply_text = "I couldn't generate a meaningful response."
+
+    except Exception as e:
+        print("Chat LLM failed:", e)
+        reply_text = "⚠️ Error generating explanation. Please try again."
+
+    return {
+        "reply": reply_text
+    }
+
+
+# ==========================================================
+# HEALTH CHECK
+# ==========================================================
+@app.get("/health")
+async def health_check():
+    return {"status": "online"}
