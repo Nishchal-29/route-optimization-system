@@ -5,24 +5,14 @@ from folium.plugins import HeatMap
 from dotenv import load_dotenv
 from typing import List, Dict, Tuple, Optional
 import time
-import math
 
 load_dotenv()
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY")
-
 TOMTOM_BASE_URL = "https://api.tomtom.com"
 TOMTOM_TRAFFIC_FLOW_VERSION = "4"  
 
 def get_route_bbox(locations: List[Dict]) -> Tuple[float, float, float, float]:
-    """
-    Calculate bounding box for a list of locations.
-    
-    Args:
-        locations: List of dicts with 'lat' and 'lon' keys
-        
-    Returns:
-        Tuple of (min_lon, min_lat, max_lon, max_lat)
-    """
+    """Calculate bounding box for a list of locations."""
     if not locations:
         return (0, 0, 0, 0)
     
@@ -38,30 +28,13 @@ def get_route_bbox(locations: List[Dict]) -> Tuple[float, float, float, float]:
     )
 
 def fetch_traffic_flow_segment(lat: float, lon: float, zoom: int = 10) -> Optional[Dict]:
-    """
-    Fetch traffic flow data for a specific point using TomTom Traffic Flow Segment Data.
-    
-    API Endpoint: Traffic Flow Segment Data
-    Documentation: https://developer.tomtom.com/traffic-api/documentation/traffic-flow/flow-segment-data
-    
-    Args:
-        lat: Latitude of the point
-        lon: Longitude of the point
-        zoom: Zoom level (0-22, where 10 is typical city view)
-        
-    Returns:
-        Traffic flow data or None if request fails
-    """
-    if not TOMTOM_API_KEY:
-        print("[Traffic] Warning: TOMTOM_API_KEY not configured")
-        return None
-    
+    """Fetch traffic flow data for a specific point using TomTom Traffic Flow Segment Data."""    
     url = f"{TOMTOM_BASE_URL}/traffic/services/{TOMTOM_TRAFFIC_FLOW_VERSION}/flowSegmentData/relative/{zoom}/json"
     
     params = {
         "key": TOMTOM_API_KEY,
         "point": f"{lat},{lon}",
-        "unit": "KMPH"  # Speed unit
+        "unit": "KMPH" 
     }
     
     try:
@@ -73,25 +46,8 @@ def fetch_traffic_flow_segment(lat: float, lon: float, zoom: int = 10) -> Option
         return None
 
 def fetch_traffic_incidents(bbox: Tuple[float, float, float, float]) -> Optional[Dict]:
-    """
-    Fetch traffic incidents (accidents, road closures) in a bounding box.
-    
-    API Endpoint: Traffic Incidents
-    Documentation: https://developer.tomtom.com/traffic-api/documentation/traffic-incidents/incident-details
-    
-    Args:
-        bbox: Bounding box (min_lon, min_lat, max_lon, max_lat)
-        
-    Returns:
-        Traffic incidents data or None if request fails
-    """
-    if not TOMTOM_API_KEY:
-        return None
-    
+    """Fetch traffic incidents (accidents, road closures) in a bounding box."""
     min_lon, min_lat, max_lon, max_lat = bbox
-    
-    # TomTom Incident Details API
-    # Format: /traffic/services/{versionNumber}/incidentDetails
     url = f"{TOMTOM_BASE_URL}/traffic/services/5/incidentDetails"
     
     params = {
@@ -111,72 +67,10 @@ def fetch_traffic_incidents(bbox: Tuple[float, float, float, float]) -> Optional
         print(f"[Traffic] TomTom Incidents API error: {e}")
         return None
 
-# def fetch_all_incidents_dynamic(bbox: Tuple[float, float, float, float]) -> Dict:
-#     """
-#     Dynamically subdivides the bbox into tiles smaller than 10,000 km^2.
-#     """
-#     min_lon, min_lat, max_lon, max_lat = bbox
-    
-#     # 1. Calculate approximate dimensions in kilometers
-#     # 1 degree lat is ~111km. 1 degree lon at 27 deg N is ~99km.
-#     width_km = abs(max_lon - min_lon) * 99 
-#     height_km = abs(max_lat - min_lat) * 111
-#     total_area = width_km * height_km
-    
-#     MAX_ALLOWED_AREA = 9500  # Safety margin under 10,000
-    
-#     # 2. Determine grid size
-#     if total_area <= MAX_ALLOWED_AREA:
-#         grid_x = grid_y = 1
-#     else:
-#         # Calculate how many tiles we need to cover the area
-#         ratio = math.ceil(math.sqrt(total_area / MAX_ALLOWED_AREA))
-#         grid_x = ratio # Number of horizontal splits
-#         grid_y = ratio # Number of vertical splits
-
-#     all_incidents = []
-#     seen_ids = set()
-    
-#     lon_step = (max_lon - min_lon) / grid_x
-#     lat_step = (max_lat - min_lat) / grid_y
-
-#     for i in range(grid_x):
-#         for j in range(grid_y):
-#             tile_bbox = (
-#                 min_lon + (i * lon_step),
-#                 min_lat + (j * lat_step),
-#                 min_lon + ((i + 1) * lon_step),
-#                 min_lat + ((j + 1) * lat_step)
-#             )
-            
-#             data = fetch_traffic_incidents(tile_bbox)            
-#             if data and 'incidents' in data:
-#                 for incident in data['incidents']:
-#                     inc_id = incident.get('properties', {}).get('id')
-#                     if inc_id not in seen_ids:
-#                         all_incidents.append(incident)
-#                         seen_ids.add(inc_id)
-            
-#             time.sleep(0.2)
-            
-#     return {"incidents": all_incidents}
-
 def fetch_incidents_for_route_stops(locations: List[Dict], buffer: float = 0.4) -> Dict:
-    """
-    Fetches incidents specifically around each stop on the route.
-    
-    Args:
-        locations: List of dicts with 'lat' and 'lon'
-        buffer: Size in degrees around each point
-        
-    Returns:
-        Combined incidents dictionary
-    """
+    """Fetches incidents specifically around each stop on the route."""
     all_combined_incidents = []
     seen_ids = set()
-
-    print(f"[Traffic] Fetching incidents for {len(locations)} stop areas...")
-
     for loc in locations:
         lat, lon = loc['lat'], loc['lon']
         stop_bbox = (
@@ -200,98 +94,63 @@ def fetch_incidents_for_route_stops(locations: List[Dict], buffer: float = 0.4) 
     return {"incidents": all_combined_incidents}
 
 def analyze_traffic_flow(flow_data: Dict) -> Dict:
-    """
-    Analyze traffic flow data to determine congestion level.
-    
-    Args:
-        flow_data: Raw traffic flow data from TomTom API
-        
-    Returns:
-        Analysis with congestion level and metrics
-    """
     if not flow_data or 'flowSegmentData' not in flow_data:
-        return {
-            "congestion_level": "unknown",
-            "current_speed": 0,
-            "free_flow_speed": 0,
-            "delay_factor": 0,
-            "confidence": 0
-        }
-    
+        return {"congestion_level": "unknown", "coordinates": []}
+
     segment = flow_data['flowSegmentData']
-    
-    # Extract metrics
     current_speed = segment.get('currentSpeed', 0)
-    free_flow_speed = segment.get('freeFlowSpeed', 50) 
     current_travel_time = segment.get('currentTravelTime', 0)
+    free_flow_speed = segment.get('freeFlowSpeed', 50)
     free_flow_travel_time = segment.get('freeFlowTravelTime', 0)
-    confidence = segment.get('confidence', 0)
+    raw_coords = segment.get('coordinates', {}).get('coordinate', [])
+    road_coords = [[pt['latitude'], pt['longitude']] for pt in raw_coords]
     
-    # delay_factor: 0 = no delay, 1+ = delayed
-    if free_flow_travel_time > 0:
-        delay_factor = current_travel_time / free_flow_travel_time
-    elif free_flow_speed > 0:
-        delay_factor = free_flow_speed / max(current_speed, 1)
-    else:
+    if free_flow_travel_time > 0: 
+        delay_factor = current_travel_time / free_flow_travel_time 
+    elif free_flow_speed > 0: 
+        delay_factor = free_flow_speed / max(current_speed, 1) 
+    else: 
         delay_factor = 0
-    
-    # Calculate speed ratio (0-1, where 1 is free flow)
+
     speed_ratio = current_speed / max(free_flow_speed, 1)
-    
-    # Determine congestion level based on speed ratio
+
     if speed_ratio >= 0.8:
-        congestion_level = "free_flow"
         color = "green"
+        congestion = "free_flow"
     elif speed_ratio >= 0.6:
-        congestion_level = "light"
         color = "yellow"
+        congestion = "light"
     elif speed_ratio >= 0.4:
-        congestion_level = "moderate"
         color = "orange"
+        congestion = "moderate"
     elif speed_ratio >= 0.2:
-        congestion_level = "heavy"
         color = "red"
+        congestion = "heavy"
     else:
-        congestion_level = "severe"
         color = "darkred"
-    
+        congestion = "severe"
+
     return {
-        "congestion_level": congestion_level,
+        "congestion_level": congestion,
         "color": color,
         "current_speed": current_speed,
         "free_flow_speed": free_flow_speed,
         "speed_ratio": speed_ratio,
         "delay_factor": delay_factor,
-        "confidence": confidence,
-        "coordinates": segment.get('coordinates', {})
+        "coordinates": road_coords
     }
 
 def collect_traffic_data_for_route(locations: List[Dict]) -> Tuple[List, Dict]:
-    """
-    Collect traffic data for all segments in a route.
-    
-    Args:
-        locations: List of location dicts with 'lat', 'lon', 'name'
-        
-    Returns:
-        Tuple of (heatmap_data, analysis_summary)
-    """
+    """Collect traffic data for all segments in a route."""
     heatmap_data = []
     segment_analyses = []
     total_delays = 0
-    severe_segments = 0
-    
-    print(f"[Traffic] Collecting traffic data for {len(locations)} locations...")
-    
+    severe_segments = 0    
     for i, location in enumerate(locations):
-        # Get traffic at this point
         flow_data = fetch_traffic_flow_segment(location['lat'], location['lon'])
         
         if flow_data:
             analysis = analyze_traffic_flow(flow_data)
-            
-            # Add to heatmap
-            # Intensity: 0 (green/free flow) to 1 (red/severe)
             intensity = 1 - analysis['speed_ratio']
             heatmap_data.append([
                 location['lat'],
@@ -299,7 +158,6 @@ def collect_traffic_data_for_route(locations: List[Dict]) -> Tuple[List, Dict]:
                 intensity
             ])
             
-            # Track severe segments
             if analysis['congestion_level'] in ['heavy', 'severe']:
                 severe_segments += 1
             
@@ -314,7 +172,6 @@ def collect_traffic_data_for_route(locations: List[Dict]) -> Tuple[List, Dict]:
         
         time.sleep(0.2)
     
-    # Calculate overall status
     avg_delay = total_delays / len(locations) if locations else 0
     
     if severe_segments > len(locations) * 0.3:
@@ -334,17 +191,51 @@ def collect_traffic_data_for_route(locations: List[Dict]) -> Tuple[List, Dict]:
     
     return heatmap_data, analysis_summary
 
+def draw_local_road_traffic(m, center_lat, center_lon, radius_km=1.2):
+    """Draws traffic road segments around a point using TomTom Flow API"""
+    steps = 4
+    offset = radius_km / 111.0
+
+    lat_points = [
+        center_lat - offset + i * (2 * offset / steps)
+        for i in range(steps + 1)
+    ]
+    lon_points = [
+        center_lon - offset + i * (2 * offset / steps)
+        for i in range(steps + 1)
+    ]
+
+    seen_segments = set()
+
+    for lat in lat_points:
+        for lon in lon_points:
+            data = fetch_traffic_flow_segment(lat, lon)
+            if not data:
+                continue
+
+            analysis = analyze_traffic_flow(data)
+            coords = analysis["coordinates"]
+            if len(coords) < 2:
+                continue
+
+            segment_id = str(coords[0])
+            if segment_id in seen_segments:
+                continue
+
+            folium.PolyLine(
+                locations=coords,
+                color=analysis["color"],
+                weight=6,
+                opacity=0.9,
+                tooltip=f"{analysis['current_speed']} km/h"
+            ).add_to(m)
+
+            seen_segments.add(segment_id)
+
+            time.sleep(0.2)
+
 def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Dict]] = None) -> Dict:
-    """
-    Generate an interactive HTML map with traffic conditions.
-    
-    Args:
-        locations: List of location dicts with 'name', 'lat', 'lon'
-        route_sequence: Optional ordered sequence for route visualization
-        
-    Returns:
-        Dict with map_file path, congestion status, and details
-    """
+    """Generate an interactive HTML map with traffic conditions."""
     if not locations:
         return {
             "map_file": None,
@@ -361,11 +252,18 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
     
     m = folium.Map(
         location=[avg_lat, avg_lon],
-        zoom_start=8,
-        tiles='OpenStreetMap'
+        zoom_start=10,
+        tiles='CartoDB dark_matter'
     )
     
-    # Add traffic heatmap layer
+    for loc in locations:
+        draw_local_road_traffic(
+            m,
+            loc["lat"],
+            loc["lon"],
+            radius_km=1.2
+        )
+    
     if heatmap_data:
         HeatMap(
             heatmap_data,
@@ -425,32 +323,27 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
         points = [[loc['lat'], loc['lon']] for loc in route_sequence]
         folium.PolyLine(
             points,
-            color='blue',
-            weight=3,
-            opacity=0.7,
+            color='white',
+            weight=2,
+            opacity=0.4,
+            dash_array='5, 10',
             popup='Planned Route'
         ).add_to(m)
     
-    # Add traffic incidents as markers
     if incidents_data and 'incidents' in incidents_data:
         incident_count = 0
         for incident in incidents_data['incidents']:
             try:
-                # Extract incident details
                 props = incident.get('properties', {})
                 geometry = incident.get('geometry', {})
                 
                 if geometry.get('type') == 'Point':
                     coords = geometry.get('coordinates', [])
                     if len(coords) >= 2:
-                        # TomTom uses [lon, lat] format
-                        incident_lat, incident_lon = coords[1], coords[0]
-                        
-                        # Get incident type
+                        incident_lat, incident_lon = coords[1], coords[0]                        
                         icon_category = props.get('iconCategory', 0)
                         magnitude = props.get('magnitudeOfDelay', 0)
                         
-                        # Determine icon and color
                         if icon_category in [1, 2, 3]:  # Accident
                             icon = 'car-crash'
                             color = 'red'
@@ -461,7 +354,6 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
                             icon = 'exclamation'
                             color = 'orange'
                         
-                        # Get description
                         events = props.get('events', [])
                         description = events[0].get('description', 'Traffic incident') if events else 'Traffic incident'
                         
@@ -475,11 +367,8 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
                         incident_count += 1
             except Exception as e:
                 print(f"[Traffic] Error processing incident: {e}")
-                continue
-        
-        print(f"[Traffic] Added {incident_count} traffic incidents to map")
+                continue        
     
-    # Add legend
     legend_html = '''
     <div style="position: fixed; 
                 bottom: 50px; left: 50px; width: 220px; height: auto; 
@@ -511,17 +400,7 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
     }
 
 def check_traffic_for_segment(start_loc: Dict, end_loc: Dict) -> Dict:
-    """
-    Check traffic conditions for a specific route segment.
-    
-    Args:
-        start_loc: Starting location dict with 'name', 'lat', 'lon'
-        end_loc: Ending location dict with 'name', 'lat', 'lon'
-        
-    Returns:
-        Dict with traffic analysis for the segment
-    """
-    # Check traffic at midpoint
+    """Check traffic conditions for a specific route segment."""
     mid_lat = (start_loc['lat'] + end_loc['lat']) / 2
     mid_lon = (start_loc['lon'] + end_loc['lon']) / 2
     
@@ -549,15 +428,7 @@ def check_traffic_for_segment(start_loc: Dict, end_loc: Dict) -> Dict:
     }
 
 def get_traffic_recommendation(analysis: Dict) -> str:
-    """
-    Generate traffic recommendation based on analysis.
-    
-    Args:
-        analysis: Traffic analysis dict
-        
-    Returns:
-        Recommendation string
-    """
+    """Generate traffic recommendation based on analysis."""
     congestion = analysis['congestion_level']
     delay_factor = analysis['delay_factor']
     
