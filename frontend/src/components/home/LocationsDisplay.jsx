@@ -8,8 +8,10 @@ export default function LocationsDisplay({ locations, optimizedRoute }) {
   let isOptimized = false;
 
   if (optimizedRoute?.optimized_route && Array.isArray(optimizedRoute.optimized_route)) {
-    // Show optimized route order
-    displayLocations = optimizedRoute.optimized_route;
+    // Map city names to full location objects
+    displayLocations = optimizedRoute.optimized_route
+      .map(name => locations.find(loc => loc.name.toLowerCase() === name.toLowerCase()))
+      .filter(Boolean);
     isOptimized = true;
   } else {
     // Show original detected order

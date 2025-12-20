@@ -116,17 +116,6 @@ export const processLogisticsRequest = async (requestText) => {
 
 /* =====================================================
    MAP FLOW
-===================================================== */
-
-/**
- * Optimize route from map-selected locations
- * @param [{ name, lat, lon }]
- */
-export const optimizeFromMap = async (locations) => {
-  if (!Array.isArray(locations) || locations.length < 2) {
-    throw new Error("Select at least two locations.");
-  }
-
   const enrichedLocations = locations.map((loc, index) => ({
     name: loc.name,
     lat: loc.lat,
@@ -138,33 +127,17 @@ export const optimizeFromMap = async (locations) => {
 };
 
 /* =====================================================
-   CHAT / EXPLANATION FLOW 🧠🤖
-===================================================== */
-
-/**
- * Send message to LogiBOT
- * Used for:
- * - Route explanation
- * - Traffic / weather reasoning
- * - Summary generation
- * - User requested modifications
- */
-export const sendChatMessage = async (message, context) => {
+   MANIFEST & AGENT FLOW 🚛🤖
   if (!message || typeof message !== "string") {
     throw new Error("Chat message must be a non-empty string.");
   }
 
-  // 🔐 Guarantee valid JSON object (prevents 422)
-  const safeContext =
-    context && typeof context === "object" && !Array.isArray(context)
-      ? context
-      : {};
+  const payload = {
+    message: message.trim(),
+    session_id: sessionId,
+  };
 
-  const response = await api.post("/chat", {
-    message,
-    context: safeContext,
-  });
-
+  const response = await api.post("/agent/chat", payload);
   return response.data;
 };
 

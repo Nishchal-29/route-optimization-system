@@ -63,8 +63,10 @@ export default function RouteVisualization({ locations, optimizedRoute }) {
   let displayLocations = [];
   
   if (optimizedRoute?.optimized_route && Array.isArray(optimizedRoute.optimized_route)) {
-    // Use the optimized_route array directly as it contains full location objects
-    displayLocations = optimizedRoute.optimized_route;
+    // Map city names to full location objects
+    displayLocations = optimizedRoute.optimized_route
+      .map(name => locations.find(loc => loc.name.toLowerCase() === name.toLowerCase()))
+      .filter(Boolean);
   } else if (optimizedRoute?.route_sequence || optimizedRoute?.routeSequence) {
     // Fallback: map route sequence to location objects
     const routeSequence = optimizedRoute.route_sequence || optimizedRoute.routeSequence;

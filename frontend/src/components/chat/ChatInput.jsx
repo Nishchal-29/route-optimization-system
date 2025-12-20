@@ -1,46 +1,66 @@
 import { useState } from 'react';
 import { Send } from 'lucide-react';
 
-export default function ChatInput({ onSend, disabled }) {
-  const [text, setText] = useState('');
+export default function ChatInput({ onSend, disabled = false, placeholder = "Type your message..." }) {
+  const [input, setInput] = useState('');
 
-  const handleSend = () => {
-    if (!text.trim() || disabled) return;
-    onSend(text);
-    setText('');
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (input.trim() && !disabled) {
+      onSend(input.trim());
+      setInput('');
+    }
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit(e);
+    }
   };
 
   return (
-    <div className="px-6 py-4 border-t border-white/20 flex gap-3">
+    <form onSubmit={handleSubmit} className="flex gap-2">
       <input
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+        type="text"
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        onKeyPress={handleKeyPress}
+        placeholder={placeholder}
         disabled={disabled}
-        placeholder="Ask about traffic, weather, priorities or suggest changes..."
         className="
-          flex-1 px-4 py-3 rounded-xl
-          bg-black/30 text-white placeholder-white/50
-          border border-white/10
-          outline-none
-          focus:border-cyan-400
-          disabled:opacity-50
+          flex-1 
+          px-4 py-3 
+          bg-white/10 
+          border border-white/20 
+          rounded-xl 
+          text-white 
+          placeholder-white/50
+          focus:outline-none 
+          focus:ring-2 
+          focus:ring-primary-500/50
+          disabled:opacity-50 
+          disabled:cursor-not-allowed
         "
       />
-
       <button
-        onClick={handleSend}
-        disabled={disabled}
+        type="submit"
+        disabled={disabled || !input.trim()}
         className="
-          px-4 rounded-xl
-          bg-cyan-500 text-black
-          hover:bg-cyan-400
-          disabled:opacity-50
-          flex items-center justify-center
+          px-6 py-3 
+          bg-primary-500 
+          hover:bg-primary-600 
+          text-white 
+          rounded-xl 
+          transition-colors
+          disabled:opacity-50 
+          disabled:cursor-not-allowed
+          flex items-center gap-2
         "
       >
-        <Send className="w-5 h-5" />
+        <Send className="w-4 h-4" />
+        <span className="hidden sm:inline">Send</span>
       </button>
-    </div>
+    </form>
   );
 }

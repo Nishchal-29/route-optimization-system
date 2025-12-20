@@ -2,29 +2,10 @@ import { Route, Clock, Navigation, TrendingDown, AlertTriangle } from 'lucide-re
 
 export default function OptimizationResults({ result }) {
   if (!result) return null;
-
-  const formatTime = (minutes) => {
-    if (!minutes) return 'N/A';
-    const hours = minutes / 60;
-    const h = Math.floor(hours);
-    const m = Math.round((hours - h) * 60);
-    return `${h}h ${m}m`;
-  };
-
-  const formatDistance = (km) => {
-    if (!km) return 'N/A';
-    return `${km.toFixed(1)} km`;
-  };
-
-  // Handle your actual API response format
-  const totalDistance = result.total_distance_km || result.total_distance || result.totalDistance || 0;
-  const totalTime = result.total_duration_min || result.total_time || result.totalTime || 0;
-  const sequenceViolations = result.sequence_violations || 0;
-  
   // Extract route sequence from optimized_route array
-  const routeSequence = result.optimized_route 
-    ? result.optimized_route.map(loc => loc.name) 
-    : result.route_sequence || result.routeSequence || result.route || [];
+  const routeSequence = Array.isArray(result.optimized_route)
+  ? result.optimized_route
+  : result.route_sequence || result.routeSequence || result.route || [];
 
   return (
     <div className="space-y-6">
@@ -35,7 +16,7 @@ export default function OptimizationResults({ result }) {
             <p className="text-primary-100 text-sm font-medium">Total Distance</p>
             <Navigation className="w-5 h-5 text-primary-200" />
           </div>
-          <p className="text-3xl font-bold">{formatDistance(totalDistance)}</p>
+          <p className="text-3xl font-bold">{result.total_distance_km} km</p>
           <p className="text-primary-200 text-xs mt-2">Optimized route distance</p>
         </div>
 
@@ -44,25 +25,10 @@ export default function OptimizationResults({ result }) {
             <p className="text-purple-100 text-sm font-medium">Estimated Time</p>
             <Clock className="w-5 h-5 text-purple-200" />
           </div>
-          <p className="text-3xl font-bold">{formatTime(totalTime)}</p>
+          <p className="text-3xl font-bold">{result.total_duration_hours} hours</p>
           <p className="text-purple-200 text-xs mt-2">Including stops</p>
         </div>
       </div>
-
-      {/* Sequence Violations Alert */}
-      {sequenceViolations > 0 && (
-        <div className="card bg-yellow-50 border-2 border-yellow-200">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-6 h-6 text-yellow-600 flex-shrink-0" />
-            <div>
-              <p className="font-semibold text-yellow-900">Sequence Violations Detected</p>
-              <p className="text-sm text-yellow-700 mt-1">
-                {sequenceViolations} location{sequenceViolations > 1 ? 's' : ''} may not follow the requested order for optimal routing.
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Optimized Route Sequence */}
       <div className="card">
