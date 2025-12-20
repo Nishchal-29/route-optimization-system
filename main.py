@@ -3,7 +3,7 @@ import json
 import requests
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -12,7 +12,8 @@ import google.generativeai as genai
 
 from route import solve_route
 from traffic import generate_traffic_map
-from agent import run_logistics_chat, CURRENT_STATE
+from agent import run_logistics_chat
+from db import get_session_state, create_new_route_db, activate_route_db
 
 load_dotenv()
 ORS_API_KEY = os.getenv("ORS_API_KEY")
@@ -49,16 +50,19 @@ class RouteResponse(BaseModel):
 
 class ChatMessage(BaseModel):
     message: str
-    session_id: Optional[str] = Field(default="default_session")
+    session_id: str = Field(..., description="Unique session ID for the driver/user")
 
 class RouteManifest(BaseModel):
     """Request to create a new delivery manifest"""
-    locations: List[LocationPoint]
+    session_id: str = Field(..., description="Bind this route to a specific session")
+    # locations: List[LocationPoint]
+    route_id: int = Field(..., description="The ID returned by /optimize-route")
     driver_name: Optional[str] = "Driver_001"
     start_time: Optional[str] = datetime.now().isoformat()
 
 class DelayReport(BaseModel):
     """Report a delay on active route"""
+    session_id: str
     delay_minutes: int
     reason: str
     location: Optional[str] = None
@@ -127,9 +131,7 @@ async def root():
             ],
             "agent": [
                 "POST /agent/chat - Chat with AI copilot",
-                "GET /agent/status - Get current route status",
-                "POST /agent/report-delay - Report delay",
-                "POST /agent/check-traffic - Check traffic conditions"
+                "GET /agent/status - Get current route status"
             ],
             "monitoring": [
                 "GET /traffic/map - Get traffic visualization",
@@ -162,63 +164,88 @@ async def extract_sequence(query: LogisticsQuery):
     return RouteResponse(parsed_locations=final_locations)
 
 @app.post("/optimize-route")
-async def optimize_route(data: RouteResponse):
+async def optimize_route(data: RouteResponse, session_id: str = Query(..., description="Bind optimization to session")):
     """Optimize route using genetic algorithm with weather awareness"""
-    if not data.parsed_locations:
-        raise HTTPException(
-            status_code=400,
-            detail="No locations provided for route optimization"
+    try:
+        if not data.parsed_locations:
+            raise HTTPException(
+                status_code=400,
+                detail="No locations provided for route optimization"
+            )
+
+        locations_list = [loc.dict() for loc in data.parsed_locations]
+        result = solve_route(locations_list)
+        
+        if result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("message"))
+        
+        if "full_log" in result:
+            for entry in result["full_log"]:
+                if "time" in entry and isinstance(entry["time"], datetime):
+                    entry["time"] = entry["time"].isoformat()
+        
+        optimized_stops_data = []
+        stop_events = [
+            event for event in result["full_log"] 
+            if event["event"] in ["Depart", "Arrive"]
+        ]
+        route_names = result["optimized_route"]
+        
+        if len(stop_events) != len(route_names):
+            print(f"Warning: Log length {len(stop_events)} != Route length {len(route_names)}")
+        
+        for i, name in enumerate(route_names):
+            original = next((loc for loc in locations_list if loc["name"] == name), None)
+            eta_iso = None
+            if i < len(stop_events):
+                raw_time = stop_events[i]["time"]
+                if isinstance(raw_time, datetime):
+                    eta_iso = raw_time.isoformat()
+                else:
+                    eta_iso = raw_time
+                    
+            if original:
+                optimized_stops_data.append({
+                    "name": name,
+                    "lat": original["lat"],
+                    "lon": original["lon"],
+                    "visit_sequence": i + 1,
+                    "status": "completed" if i == 0 else "pending",
+                    "eta": eta_iso
+                })
+
+        route_id = create_new_route_db(
+            session_id=session_id,
+            driver_name="Driver_001",
+            stops_data=optimized_stops_data,
+            status="draft"
         )
 
-    locations_list = [loc.dict() for loc in data.parsed_locations]
-    result = solve_route(locations_list)
-    
-    if result.get("status") == "error":
-        raise HTTPException(status_code=500, detail=result.get("message"))
-    
-    return result
+        return {
+            **result, 
+            "route_id": route_id, 
+            "message": "Route optimized and saved as draft."
+        }
+    except Exception as e:
+        print(f"[optimize-route ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Optimize route failed: {str(e)}")
 
 @app.post("/create-manifest")
 async def create_manifest(manifest: RouteManifest):
     """Create a new delivery manifest and initialize the agent state"""
     try:
-        locations_list = [loc.dict() for loc in manifest.locations]        
-        result = solve_route(locations_list)
+        result = activate_route_db(manifest.route_id, manifest.driver_name)
         
-        if result.get("status") == "error":
-            raise HTTPException(status_code=500, detail=result.get("message"))        
-        route_names = result["optimized_route"]
-        full_route_objects = []
-        
-        full_route_objects.append({"name": route_names[0], "status": "completed"})
-        
-        for name in route_names[1:]:
-            matching_loc = next(
-                (loc for loc in locations_list if loc["name"].lower() == name.lower()), 
-                None
+        if not result:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Route ID {manifest.route_id} not found. Please optimize the route first."
             )
-            if matching_loc:
-                full_route_objects.append({
-                    **matching_loc,
-                    # "eta": result["full_log"],
-                    "status": "pending"
-                })
-        
-        # Update global state
-        CURRENT_STATE["active_route"] = full_route_objects
-        CURRENT_STATE["is_active"] = True
-        CURRENT_STATE["last_updated"] = datetime.now().isoformat()
-        CURRENT_STATE["driver_name"] = manifest.driver_name
         
         return {
             "status": "success",
-            "message": f"Manifest created for {manifest.driver_name}",
-            "route": {
-                "optimized_sequence": route_names,
-                "total_distance_km": result.get("total_distance_km"),
-                "total_duration_hours": result.get("total_duration_hours"),
-                "weather_alerts": result.get("weather_alerts", [])
-            },
+            "message": f"Manifest created for Session {manifest.session_id}",
+            "route_id": manifest.route_id,
             "manifest_id": f"MF_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "driver": manifest.driver_name,
             "created_at": datetime.now().isoformat()
@@ -240,7 +267,7 @@ async def agent_chat(message: ChatMessage):
     - "What's my current status?"
     """
     try:
-        response = run_logistics_chat(message.message)
+        response = run_logistics_chat(user_input=message.message, session_id=message.session_id)
         
         return {
             "status": "success",
@@ -248,108 +275,99 @@ async def agent_chat(message: ChatMessage):
             "agent_response": response,
             "session_id": message.session_id,
             "timestamp": datetime.now().isoformat(),
-            "active_route": CURRENT_STATE["is_active"]
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
 @app.get("/agent/status")
-async def get_agent_status():
+async def get_agent_status(session_id: str = Query(..., description="Session ID to fetch status for")):
     """Get current route status from agent state"""
-    if not CURRENT_STATE["is_active"]:
-        return {
-            "status": "no_active_route",
-            "message": "No active delivery route. Create a manifest first.",
-            "active": False
-        }
+    state = get_session_state(session_id)
+    if not state["is_active"]:
+        return {"status": "no_active_route", "active": False}
     
-    pending_stops = [
-        stop for stop in CURRENT_STATE["active_route"] 
-        if stop["status"] == "pending"
-    ]
-    
-    completed_stops = [
-        stop for stop in CURRENT_STATE["active_route"] 
-        if stop["status"] == "completed"
-    ]
+    stops = state["active_route"]
+    pending = [s for s in stops if s["status"] == "pending"]
+    completed = [s for s in stops if s["status"] == "completed"]
     
     return {
         "status": "active",
         "active": True,
-        "driver": CURRENT_STATE.get("driver_name", "Unknown"),
-        "last_updated": CURRENT_STATE["last_updated"],
+        "driver": state["driver_name"],
+        "last_updated": state["last_updated"],
         "route_summary": {
-            "total_stops": len(CURRENT_STATE["active_route"]),
-            "completed": len(completed_stops),
-            "pending": len(pending_stops),
+            "total_stops": len(stops),
+            "completed": len(completed),
+            "pending": len(pending),
             "progress_percentage": round(
-                (len(completed_stops) / len(CURRENT_STATE["active_route"])) * 100, 2
-            ) if CURRENT_STATE["active_route"] else 0
+                (len(completed) / len(stops)) * 100, 2
+            ) if stops else 0
         },
-        "current_location": completed_stops[-1]["name"] if completed_stops else CURRENT_STATE["active_route"][0]["name"],
-        "next_stop": pending_stops[0]["name"] if pending_stops else "Route Complete",
-        "pending_stops": [stop["name"] for stop in pending_stops],
-        "completed_stops": [stop["name"] for stop in completed_stops]
+        "current_location": completed[-1]["name"] if completed else stops[0]["name"],
+        "next_stop": pending[0]["name"] if pending else "Route Complete",
+        "pending_stops": [stop["name"] for stop in pending],
+        "completed_stops": [stop["name"] for stop in completed],
+        "route_details": stops
     }
 
-@app.post("/agent/report-delay")
-async def report_delay(delay: DelayReport):
-    """Report a delay and get agent recommendation"""
-    if not CURRENT_STATE["is_active"]:
-        raise HTTPException(
-            status_code=404,
-            detail="No active route. Create a manifest first."
-        )
+# @app.post("/agent/report-delay")
+# async def report_delay(delay: DelayReport):
+#     """Report a delay and get agent recommendation"""
+#     if not CURRENT_STATE["is_active"]:
+#         raise HTTPException(
+#             status_code=404,
+#             detail="No active route. Create a manifest first."
+#         )
     
-    # Use agent to process the delay
-    message = f"I'm delayed by {delay.delay_minutes} minutes due to {delay.reason}"
-    if delay.location:
-        message += f" at {delay.location}"
+#     # Use agent to process the delay
+#     message = f"I'm delayed by {delay.delay_minutes} minutes due to {delay.reason}"
+#     if delay.location:
+#         message += f" at {delay.location}"
     
-    agent_response = run_logistics_chat(message)
+#     agent_response = run_logistics_chat(message)
     
-    return {
-        "status": "success",
-        "delay_recorded": {
-            "minutes": delay.delay_minutes,
-            "reason": delay.reason,
-            "location": delay.location,
-            "timestamp": datetime.now().isoformat()
-        },
-        "agent_recommendation": agent_response
-    }
+#     return {
+#         "status": "success",
+#         "delay_recorded": {
+#             "minutes": delay.delay_minutes,
+#             "reason": delay.reason,
+#             "location": delay.location,
+#             "timestamp": datetime.now().isoformat()
+#         },
+#         "agent_recommendation": agent_response
+#     }
 
-@app.post("/agent/check-traffic")
-async def check_traffic_status():
-    """Check real-time traffic for active route"""
-    if not CURRENT_STATE["is_active"]:
-        raise HTTPException(
-            status_code=404,
-            detail="No active route. Create a manifest first."
-        )
+# @app.post("/agent/check-traffic")
+# async def check_traffic_status():
+#     """Check real-time traffic for active route"""
+#     if not CURRENT_STATE["is_active"]:
+#         raise HTTPException(
+#             status_code=404,
+#             detail="No active route. Create a manifest first."
+#         )
     
-    # Use agent's traffic checking tool
-    agent_response = run_logistics_chat("Check traffic conditions for my route")
+#     agent_response = run_logistics_chat("Check traffic conditions for my route")
     
-    return {
-        "status": "success",
-        "traffic_check": agent_response,
-        "timestamp": datetime.now().isoformat()
-    }
+#     return {
+#         "status": "success",
+#         "traffic_check": agent_response,
+#         "timestamp": datetime.now().isoformat()
+#     }
 
-# TRAFFIC & MONITORING ENDPOINTS
 @app.get("/traffic/map")
-async def get_traffic_map():
+async def get_traffic_map(session_id: str = Query(...)):
     """Generate and return traffic visualization map"""
-    if not CURRENT_STATE["is_active"]:
-        raise HTTPException(
-            status_code=404,
-            detail="No active route to visualize. Create a manifest first."
-        )
+    state = get_session_state(session_id)
+    if not state["is_active"]:
+        raise HTTPException(status_code=404, detail="No active route found for this session.")
     
     try:
-        locations = CURRENT_STATE["active_route"]
+        locations = [{
+            "name": s["name"],
+            "lat": s["lat"],
+            "lon": s["lon"]
+        } for s in state["active_route"]]
         result = generate_traffic_map(locations, route_sequence=locations)
         
         return {
@@ -357,7 +375,7 @@ async def get_traffic_map():
             "map_file": result["map_file"],
             "congestion_status": result["congestion_status"],
             "details": result["details"],
-            "download_url": f"/traffic/download-map"
+            "download_url": "/traffic/download-map"
         }
         
     except Exception as e:

@@ -9,70 +9,79 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from route import solve_route
 from traffic import generate_traffic_map
-
+from db import get_session_state, mark_stop_complete_db, update_etas_db
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # STATE MANAGEMENT
-CURRENT_STATE = {
-    "active_route": [],  # List of stops with status
-    "is_active": False,
-    "last_updated": None,
-    "driver_name": None,
-    "total_distance": 0,
-    "total_duration": 0
-}
+# CURRENT_STATE = {
+#     "active_route": [],  # List of stops with status
+#     "is_active": False,
+#     "last_updated": None,
+#     "driver_name": None,
+#     "total_distance": 0,
+#     "total_duration": 0
+# }
 
 # AGENT TOOLS
 @tool
-def get_route_status():
+def get_route_status(session_id: str):
     """
     Returns the current active route, showing which stops are pending or completed.
     Use this tool to check the driver's progress.
     """
-    if not CURRENT_STATE["is_active"]:
-        return "No active route. Please create a delivery manifest first."
+    state = get_session_state(session_id)
+    if not state["is_active"]:
+        return "No active route found for this session. Please create a delivery manifest first."
     
     status_summary = [
-        f"Driver: {CURRENT_STATE.get('driver_name', 'Unknown')}",
-        f"Last Updated: {CURRENT_STATE['last_updated']}",
+        f"Driver: {state['driver_name']}",
+        f"Last Updated: {state['last_updated']}",
         "\nRoute Progress:"
     ]
     
-    for idx, stop in enumerate(CURRENT_STATE["active_route"]):
+    for idx, stop in enumerate(state["active_route"]):
         status_icon = "✓" if stop['status'] == "completed" else "○"
+        eta_str = ""
+        if stop.get("eta"):
+            try:
+                dt = datetime.fromisoformat(stop["eta"])
+                eta_str = f" [ETA: {dt.strftime('%H:%M %d-%b')}]"
+            except:
+                pass
         status_summary.append(
-            f"{status_icon} {idx+1}. {stop['name']} [{stop['status'].upper()}]"
+            f"{status_icon} {idx+1}. {stop['name']}{eta_str} - [{stop['status'].upper()}]"
         )
     
-    completed = sum(1 for s in CURRENT_STATE["active_route"] if s['status'] == 'completed')
-    total = len(CURRENT_STATE["active_route"])
+    completed = sum(1 for s in state["active_route"] if s['status'] == 'completed')
+    total = len(state["active_route"])
     progress = (completed / total * 100) if total > 0 else 0
     
     status_summary.append(f"\nProgress: {completed}/{total} stops ({progress:.1f}%)")
+    print(status_summary)
     
     return "\n".join(status_summary)
 
 @tool
-def mark_stop_completed(stop_name: str):
+def mark_stop_completed(session_id: str, stop_name: str):
     """
     Mark a delivery stop as completed.
     Use this when driver confirms delivery at a location.
     """
-    if not CURRENT_STATE["is_active"]:
+    state = get_session_state(session_id)
+    if not state["is_active"]:
         return "No active route."
     
-    for stop in CURRENT_STATE["active_route"]:
+    for stop in state["active_route"]:
         if stop["name"].lower() == stop_name.lower():
             if stop["status"] == "completed":
                 return f"{stop_name} is already marked as completed."
             
-            stop["status"] = "completed"
+            mark_stop_complete_db(stop["id"])
             stop["completed_at"] = datetime.now().isoformat()
-            CURRENT_STATE["last_updated"] = datetime.now().isoformat()
             
             # Find next stop
-            next_stops = [s for s in CURRENT_STATE["active_route"] if s["status"] == "pending"]
+            next_stops = [s for s in state["active_route"] if s["status"] == "pending"]
             next_stop = next_stops[0]["name"] if next_stops else "All stops completed!"
             
             return f"✓ {stop_name} marked as completed. Next stop: {next_stop}"
@@ -80,56 +89,45 @@ def mark_stop_completed(stop_name: str):
     return f"Stop '{stop_name}' not found in the route."
 
 @tool
-def report_delay_and_update_eta(delay_minutes: int, reason: str):
+def report_delay_and_update_eta(session_id: str, delay_minutes: int, reason: str):
     """
     Report a delay and update estimated arrival times.
     Use this when driver reports traffic, breakdown, or other delays.
     """
-    if not CURRENT_STATE["is_active"]:
+    state = get_session_state(session_id)
+    if not state["is_active"]:
         return "No active route to update."
     
-    # Log the delay
-    delay_record = {
-        "timestamp": datetime.now().isoformat(),
-        "delay_minutes": delay_minutes,
-        "reason": reason
-    }
-    
-    if "delays" not in CURRENT_STATE:
-        CURRENT_STATE["delays"] = []
-    CURRENT_STATE["delays"].append(delay_record)
-    
-    CURRENT_STATE["last_updated"] = datetime.now().isoformat()
-    
-    # Calculate impact
-    remaining_stops = [s for s in CURRENT_STATE["active_route"] if s["status"] == "pending"]
+    updates_made = update_etas_db(state["route_id"], delay_minutes)
+    remaining_stops = [s for s in state["active_route"] if s["status"] == "pending"]
     
     response = [
-        f"Delay recorded: {delay_minutes} minutes due to {reason}",
-        f"Impact: All remaining ETAs pushed back by {delay_minutes} minutes",
-        f"Remaining stops: {len(remaining_stops)}"
+        f"Delay Recorded: {delay_minutes} minutes",
+        f"Reason: {reason}",
+        f"Impact: Updated ETAs for {updates_made} remaining stops."
     ]
     
-    if delay_minutes > 30:
-        response.append("Significant delay detected. Consider notifying customers.")
+    if delay_minutes > 45:
+        response.append("\nThis is a significant delay. The system recommends notifying the recipient.")
     
     if "traffic" in reason.lower() or "jam" in reason.lower():
-        response.append("Tip: Use check_traffic_conditions tool to find alternative routes.")
+        response.append("\nTip: You can ask me to 'check traffic' to see if there is a faster alternative route.")
     
     return "\n".join(response)
 
 @tool
-def check_traffic_conditions():
+def check_traffic_conditions(session_id: str):
     """
     Check real-time traffic conditions for the active route.
     Generates a traffic heatmap and identifies congestion zones.
     Use this when driver reports traffic or wants to check conditions ahead.
     """
-    if not CURRENT_STATE["is_active"]:
+    state = get_session_state(session_id)
+    if not state["is_active"]:
         return "No active route to check traffic for."
     
     try:
-        locations = CURRENT_STATE["active_route"]        
+        locations = state["active_route"]        
         result = generate_traffic_map(locations, route_sequence=locations)
         
         response = [
@@ -151,18 +149,19 @@ def check_traffic_conditions():
         return f"Traffic check failed: {str(e)}. Please try again later."
 
 @tool
-def reoptimize_remaining_route():
+def reoptimize_remaining_route(session_id: str):
     """
     Re-optimize the remaining route based on current location.
     Use this when driver wants to find a better route for remaining stops,
     or when significant delays require route changes.
     """
-    if not CURRENT_STATE["is_active"]:
+    state = get_session_state(session_id)
+    if not state["is_active"]:
         return "No active route to optimize."
     
     # Get remaining stops
     remaining_stops = [
-        s for s in CURRENT_STATE["active_route"] 
+        s for s in state["active_route"] 
         if s["status"] == "pending"
     ]
     
@@ -174,10 +173,8 @@ def reoptimize_remaining_route():
     
     try:
         # Get current location (last completed stop or starting point)
-        completed_stops = [s for s in CURRENT_STATE["active_route"] if s["status"] == "completed"]
-        current_location = completed_stops[-1] if completed_stops else CURRENT_STATE["active_route"][0]
-        
-        # Prepare locations for optimization
+        completed_stops = [s for s in state["active_route"] if s["status"] == "completed"]
+        current_location = completed_stops[-1] if completed_stops else state["active_route"][0]        
         locations_to_optimize = [current_location] + remaining_stops
         
         print("[Agent] Re-optimizing remaining route...")
@@ -185,7 +182,7 @@ def reoptimize_remaining_route():
         
         if result.get("status") == "success":
             new_sequence = result["optimized_route"]
-            new_active_route = [s for s in CURRENT_STATE["active_route"] if s["status"] == "completed"]
+            new_active_route = [s for s in state["active_route"] if s["status"] == "completed"]
             
             for city_name in new_sequence[1:]:  # Skip first (current location)
                 matching_stop = next(
@@ -195,8 +192,8 @@ def reoptimize_remaining_route():
                 if matching_stop:
                     new_active_route.append(matching_stop)
             
-            CURRENT_STATE["active_route"] = new_active_route
-            CURRENT_STATE["last_updated"] = datetime.now().isoformat()
+            state["active_route"] = new_active_route
+            state["last_updated"] = datetime.now().isoformat()
             
             response = [
                 "Route re-optimized successfully!",
@@ -216,15 +213,16 @@ def reoptimize_remaining_route():
         return f"Re-optimization error: {str(e)}"
 
 @tool
-def get_weather_forecast():
+def get_weather_forecast(session_id: str):
     """
     Get weather forecast for remaining stops on the route.
     Use this to check if weather conditions might affect the journey.
     """
-    if not CURRENT_STATE["is_active"]:
+    state = get_session_state(session_id)
+    if not state["is_active"]:
         return "No active route."
     
-    remaining_stops = [s for s in CURRENT_STATE["active_route"] if s["status"] == "pending"]
+    remaining_stops = [s for s in state["active_route"] if s["status"] == "pending"]
     
     if not remaining_stops:
         return "All stops completed."
@@ -237,13 +235,12 @@ def get_weather_forecast():
     ]
     
     # If weather alerts exist in state
-    if CURRENT_STATE.get("weather_alerts"):
-        response.append("\nActive Weather Alerts:")
-        for alert in CURRENT_STATE["weather_alerts"]:
-            response.append(f"  • {alert}")
-    else:
-        response.append("\n✓ No severe weather alerts for planned route.")
-        response.append("Note: Weather is continuously monitored during route optimization.")
+    # if CURRENT_STATE.get("weather_alerts"):
+    #     response.append("\nActive Weather Alerts:")
+    #     for alert in CURRENT_STATE["weather_alerts"]:
+    #         response.append(f"  • {alert}")
+    response.append("\n✓ No severe weather alerts for planned route.")
+    response.append("Note: Weather is continuously monitored during route optimization.")
     
     return "\n".join(response)
 
@@ -267,22 +264,27 @@ tools = [
 llm_with_tools = llm.bind_tools(tools)
 
 # CHAT RUNTIME
-def run_logistics_chat(user_input: str) -> str:
+def run_logistics_chat(user_input: str, session_id: str) -> str:
     """
     Main function to interact with the logistics agent.
     """
-    print(f"\n[User] {user_input}")
+    print(f"\n[User - Session {session_id}] {user_input}")
     
     # System prompt defines agent behavior
-    system_prompt = """
+    system_prompt = f"""
     You are 'LogiBot', an AI Logistics Assistant for truck drivers and fleet managers.
     
+    CRITICAL CONTEXT:
+    - You are serving Session ID: "{session_id}"
+    - When calling tools, YOU MUST PASS "{session_id}" as the 'session_id' argument.
+    
     Your capabilities:
-    - Track delivery routes and progress
+    - Track delivery routes, their progress and ETAs
     - Monitor real-time traffic conditions
     - Handle delay reports and re-optimize routes
     - Check weather forecasts
     - Mark deliveries as completed
+    - Provide real-time ETAs for each stop
     
     Guidelines:
     1. ALWAYS check if a route exists before trying to modify it
@@ -291,8 +293,6 @@ def run_logistics_chat(user_input: str) -> str:
     4. If significant delays reported (>30 min), suggest re-optimization
     5. Be helpful, concise, and proactive with safety recommendations
     6. Use emojis sparingly for important alerts (⚠️, ✓)
-    
-    Current Status: {"Active Route" if CURRENT_STATE["is_active"] else "No Active Route"}
     """
     
     messages = [
@@ -323,7 +323,7 @@ def run_logistics_chat(user_input: str) -> str:
                 selected_tool = tool_map.get(tool_call["name"])
                 if selected_tool:
                     tool_output = selected_tool.invoke(tool_call["args"])
-                    print(f"  [Tool Output] {tool_output[:100]}...")
+                    print(f"  [Tool Output] {tool_output}...")
                     
                     messages.append(
                         ToolMessage(
