@@ -122,7 +122,7 @@ export const processLogisticsRequest = async (requestText, sessionId) => {
  * Optimize route from map-selected locations
  * @param [{ name, lat, lon }]
  */
-export const optimizeFromMap = async (locations) => {
+export const optimizeFromMap = async (locations, session_id) => {
   if (!Array.isArray(locations) || locations.length < 2) {
     throw new Error("Select at least two locations.");
   }
@@ -134,7 +134,7 @@ export const optimizeFromMap = async (locations) => {
     visit_sequence: index + 1,
   }));
 
-  return optimizeRoute(enrichedLocations);
+  return optimizeRoute(enrichedLocations, session_id);
 };
 
 /* =====================================================
@@ -232,6 +232,55 @@ export const sendAgentMessage = async (message, sessionId) => {
   const response = await api.post("/agent/chat", payload);
   return response.data;
 };
+
+/* =====================================================
+   ROUTE SUMMARY
+===================================================== */
+
+/**
+ * Fetch summarized route from backend
+ * @param {Object} optimizedRoute - Optimized route object returned by backend
+ * @param {Array} locations - Array of location objects [{name, lat, lon, visit_sequence}]
+ */
+export const getRouteSummary = async (optimizedResult, locations) => {
+  try {
+    if (!optimizedResult?.optimized_route || !Array.isArray(locations)) {
+      throw new Error("Invalid route data for summary");
+    }
+
+    // Rebuild ordered route with lat/lon
+    const orderedRoute = optimizedResult.optimized_route.map((name, index) => {
+      const loc = locations.find(l => l.name === name);
+
+      if (!loc) {
+        throw new Error(`Location not found for ${name}`);
+      }
+
+      return {
+        name: loc.name,
+        lat: loc.lat,
+        lon: loc.lon,
+        visit_sequence: index + 1
+      };
+    });
+
+    const payload = {
+      optimized_route: orderedRoute,
+      total_distance_km: optimizedResult.total_distance_km || 0,
+      total_duration_hours: optimizedResult.total_duration_hours || 0,
+      weather_alerts: optimizedResult.weather_alerts || [],
+      full_log: optimizedResult.full_log || []
+    };
+
+    const response = await api.post("/route/summary", payload);
+    return response.data;
+
+  } catch (error) {
+    console.error("API Error - getRouteSummary:", error);
+    throw error;
+  }
+};
+
 
 /* =====================================================
    HEALTH CHECK

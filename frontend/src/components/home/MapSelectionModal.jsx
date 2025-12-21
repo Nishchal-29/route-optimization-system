@@ -45,7 +45,7 @@ async function reverseGeocode(lat, lon) {
   );
 }
 
-/* ---------------- MODAL COMPONENT ---------------- */
+/* ---------------- MODAL ---------------- */
 export default function MapSelectionModal({ onClose, onOptimize }) {
   const [locations, setLocations] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -56,6 +56,7 @@ export default function MapSelectionModal({ onClose, onOptimize }) {
     setLocations((prev) => [
       ...prev,
       {
+        id: crypto.randomUUID(),
         name,
         lat,
         lon: lng,
@@ -63,12 +64,13 @@ export default function MapSelectionModal({ onClose, onOptimize }) {
     ]);
   }
 
+  function removeLocation(id) {
+    setLocations((prev) => prev.filter((l) => l.id !== id));
+  }
+
   function handleOptimize() {
     if (locations.length < 2) return;
-
     setLoading(true);
-
-    // ✅ ONLY SEND LOCATIONS TO APP
     onOptimize(locations);
   }
 
@@ -76,7 +78,7 @@ export default function MapSelectionModal({ onClose, onOptimize }) {
     <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center">
       <div className="bg-white w-[90%] h-[90%] rounded-xl shadow-xl relative flex flex-col">
 
-        {/* ---------------- HEADER ---------------- */}
+        {/* HEADER */}
         <div className="flex justify-between items-center p-4 border-b">
           <h2 className="text-lg font-semibold">Select Cities from Map</h2>
           <button onClick={onClose}>
@@ -84,7 +86,7 @@ export default function MapSelectionModal({ onClose, onOptimize }) {
           </button>
         </div>
 
-        {/* ---------------- MAP ---------------- */}
+        {/* MAP */}
         <div className="flex-1">
           <MapContainer
             center={[20.5937, 78.9629]}
@@ -92,26 +94,51 @@ export default function MapSelectionModal({ onClose, onOptimize }) {
             className="h-full w-full"
           >
             <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-
             <MapClickHandler onAdd={handleAddLocation} />
 
             {locations.map((loc, i) => (
-              <Marker key={i} position={[loc.lat, loc.lon]}>
+              <Marker key={loc.id} position={[loc.lat, loc.lon]}>
                 <Popup>
-                  {i + 1}. {loc.name}
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium">
+                      {i + 1}. {loc.name}
+                    </span>
+                    <button
+                      onClick={() => removeLocation(loc.id)}
+                      className="text-red-600 hover:text-red-800"
+                    >
+                      ❌
+                    </button>
+                  </div>
                 </Popup>
               </Marker>
             ))}
           </MapContainer>
         </div>
 
-        {/* ---------------- FOOTER ---------------- */}
+        {/* FOOTER */}
         <div className="p-4 border-t flex justify-between items-center gap-4">
-          <div className="text-sm text-gray-600 overflow-x-auto">
-            Selected:&nbsp;
-            {locations.length > 0
-              ? locations.map((l) => l.name).join(" → ")
-              : "Click on map to add cities"}
+          <div className="flex gap-2 flex-wrap text-sm">
+            {locations.length === 0 && (
+              <span className="text-gray-500">
+                Click on map to add cities
+              </span>
+            )}
+
+            {locations.map((l, i) => (
+              <span
+                key={l.id}
+                className="bg-gray-100 px-2 py-1 rounded-full flex items-center gap-1"
+              >
+                {i + 1}. {l.name}
+                <button
+                  onClick={() => removeLocation(l.id)}
+                  className="text-red-500 hover:text-red-700"
+                >
+                  <X size={12} />
+                </button>
+              </span>
+            ))}
           </div>
 
           <button

@@ -66,6 +66,14 @@ class DelayReport(BaseModel):
     delay_minutes: int
     reason: str
     location: Optional[str] = None
+
+class OptimizedRouteSummaryRequest(BaseModel):
+    """Request to summarize an optimized route"""
+    optimized_route: List[LocationPoint]
+    total_distance_km: float
+    total_duration_hours: float
+    weather_alerts: Optional[List[str]] = []
+    full_log: Optional[List[Dict[str, Any]]] = []
     
 def get_coords_from_ors(location_name: str):
     """Geocode location using OpenRouteService"""
@@ -162,6 +170,59 @@ async def extract_sequence(query: LogisticsQuery):
             
     final_locations.sort(key=lambda x: x.visit_sequence)
     return RouteResponse(parsed_locations=final_locations)
+
+@app.post("/route/summary")
+async def route_summary(data: OptimizedRouteSummaryRequest):
+    """
+    Summarize an optimized route using Gemini AI.
+    Includes weather/time violations for better driver advice.
+    """
+    try:
+        if not data.optimized_route or len(data.optimized_route) < 2:
+            raise HTTPException(status_code=400, detail="At least two locations required for summary.")
+        # Prepare readable route string
+        route_text = " → ".join([loc.name for loc in data.optimized_route])
+        total_stops = len(data.optimized_route)
+        weather_text = ""
+        if data.weather_alerts:
+            weather_text = "Weather alerts: " + ", ".join(data.weather_alerts)
+
+        # Optional: include time violations from full_log
+        time_violations = []
+        for entry in data.full_log or []:
+            if entry.get("event") == "Wait" and entry.get("reason"):
+                time_violations.append(f"{entry.get('name', 'Unknown')}: {entry['reason']}")
+        time_violation_text = ""
+        if time_violations:
+            time_violation_text = "Time delays due to: " + "; ".join(time_violations)
+
+        # Gemini prompt
+        prompt = f"""
+        You are an AI Logistics Assistant. Summarize the following delivery route for the driver:
+
+        Route: {route_text}
+        Total stops: {total_stops}
+        Total distance: {data.total_distance_km} km
+        Total duration: {data.total_duration_hours} hours
+
+        {weather_text}
+        {time_violation_text}
+
+        Generate a clear, concise summary with driving advice, sequence of stops, and any important notes and also keep in mind the weather conditions given to you.
+        Warn the driver according to the details of the wether conditions about the source cities.
+        Return plain text, no JSON or markdown.
+        """
+        response = model.generate_content(prompt)
+        summary_text = response.text.strip()
+        return {
+            "status": "success",
+            "summary": summary_text
+        }
+
+    except Exception as e:
+        print(f"[route/summary ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Route summary generation failed: {str(e)}")
+
 
 @app.post("/optimize-route")
 async def optimize_route(data: RouteResponse, session_id: str = Query(..., description="Bind optimization to session")):

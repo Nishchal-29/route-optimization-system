@@ -10,13 +10,18 @@ import LoadingState from '../components/home/LoadingState';
 import ErrorDisplay from '../components/home/ErrorDisplay';
 import MapSelectionModal from '../components/home/MapSelectionModal';
 import ChatNavButton from '../components/home/ChatNavButton';
+import RouteSummary from '../components/home/RouteSummary';
+import { getRouteSummary } from '../services/api';
 
-import { processLogisticsRequest, optimizeRoute, createManifest } from '../services/api';
+import { processLogisticsRequest, optimizeRoute, createManifest, optimizeFromMap } from '../services/api';
 import { useSession } from '../hooks/useSession';
 
 function Home() {
   const navigate = useNavigate();
   const sessionId = useSession();
+
+  const [routeSummary, setRouteSummary] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
 
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
@@ -59,6 +64,34 @@ function Home() {
     }
   }, []);
 
+  // -------------------------------
+  // FETCH ROUTE SUMMARY FROM BACKEND
+  // -------------------------------
+  const fetchRouteSummary = async (optimizedRoute, locations) => {
+    setSummaryLoading(true);
+    setRouteSummary(null);
+
+    try {
+      // Call backend API defined in api.js
+      // Assuming you have an endpoint like getRouteSummary(optimizedRoute, locations)
+      const response = await getRouteSummary(optimizedRoute, locations); // <-- api.js function
+
+      // The backend should return { summary: "..." }
+      if (response?.summary) {
+        setRouteSummary(response.summary);
+      } else {
+        setRouteSummary("No summary available.");
+      }
+
+    } catch (err) {
+      console.error("Failed to fetch route summary from backend:", err);
+      setRouteSummary("Failed to fetch summary.");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+
   // --------------------------------------------------
   // TEXT BASED FLOW
   // --------------------------------------------------
@@ -87,6 +120,7 @@ function Home() {
       setOptimizationResult(result.optimized);
       setStage('results');
 
+      fetchRouteSummary(result.optimized, result.extracted.parsed_locations);
       // Save to session storage
       saveToSession(result.extracted.parsed_locations, result.optimized, false);
 
@@ -115,11 +149,13 @@ function Home() {
     setManifestCreated(false);
 
     try {
-      const optimized = await optimizeRoute(locations, sessionId);
+      const optimized = await optimizeFromMap(locations, sessionId);
 
       setExtractedLocations(locations);
       setOptimizationResult(optimized);
       setStage('results');
+
+      fetchRouteSummary(optimized, locations);
 
       // Save to session storage
       saveToSession(locations, optimized, false);
@@ -284,6 +320,13 @@ function Home() {
               <LocationsDisplay
                 locations={extractedLocations}
                 optimizedRoute={optimizationResult}
+              />
+            )}
+
+            {stage === 'results' && (
+              <RouteSummary
+                summary={routeSummary}
+                loading={summaryLoading}
               />
             )}
 
