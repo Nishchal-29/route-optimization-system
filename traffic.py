@@ -234,7 +234,7 @@ def draw_local_road_traffic(m, center_lat, center_lon, radius_km=1.2):
 
             time.sleep(0.2)
 
-def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Dict]] = None) -> Dict:
+def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Dict]] = None, filename: str = "traffic_map.html", fast_mode: bool = False) -> Dict:
     """Generate an interactive HTML map with traffic conditions."""
     if not locations:
         return {
@@ -245,7 +245,6 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
         
     avg_lat = sum(loc['lat'] for loc in locations) / len(locations)
     avg_lon = sum(loc['lon'] for loc in locations) / len(locations)
-    bbox = get_route_bbox(locations)
     
     heatmap_data, analysis_summary = collect_traffic_data_for_route(locations)
     incidents_data = fetch_incidents_for_route_stops(locations, buffer=0.4)    
@@ -253,16 +252,12 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
     m = folium.Map(
         location=[avg_lat, avg_lon],
         zoom_start=10,
-        tiles='CartoDB dark_matter'
+        tiles='OpenStreetMap'
     )
     
-    for loc in locations:
-        draw_local_road_traffic(
-            m,
-            loc["lat"],
-            loc["lon"],
-            radius_km=1.2
-        )
+    if not fast_mode: 
+        for loc in locations:
+            draw_local_road_traffic(m, loc["lat"], loc["lon"], radius_km=1.2)
     
     if heatmap_data:
         HeatMap(
@@ -385,14 +380,10 @@ def generate_traffic_map(locations: List[Dict], route_sequence: Optional[List[Di
     </div>
     '''
     m.get_root().html.add_child(folium.Element(legend_html))
-    
-    output_file = "traffic_map.html"
-    m.save(output_file)
-    
-    print(f"[Traffic] Map saved to {output_file}")
+    m.save(filename)
     
     return {
-        "map_file": output_file,
+        "map_file": filename,
         "congestion_status": analysis_summary['overall_status'],
         "details": f"Generated map with {len(heatmap_data)} traffic data points. "
                   f"{analysis_summary['severe_segments']}/{analysis_summary['total_segments']} segments with heavy traffic.",

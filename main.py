@@ -118,36 +118,6 @@ def parse_logistics_intent(text: str):
         print(f"LLM Parsing failed: {e}")
         return []
 
-# ROUTE PLANNING ENDPOINTS
-@app.get("/")
-async def root():
-    """API root with available endpoints"""
-    return {
-        "message": "AI Logistics Optimizer API",
-        "version": "2.0.0",
-        "features": [
-            "Natural language route planning",
-            "Real-time traffic monitoring",
-            "AI driver copilot",
-            "Weather-aware optimization"
-        ],
-        "endpoints": {
-            "planning": [
-                "POST /extract-sequence - Parse NL to locations",
-                "POST /optimize-route - Optimize route with GA",
-                "POST /create-manifest - Create new delivery manifest"
-            ],
-            "agent": [
-                "POST /agent/chat - Chat with AI copilot",
-                "GET /agent/status - Get current route status"
-            ],
-            "monitoring": [
-                "GET /traffic/map - Get traffic visualization",
-                "GET /health - Health check"
-            ]
-        }
-    }
-
 @app.post("/extract-sequence", response_model=RouteResponse)
 async def extract_sequence(query: LogisticsQuery):
     """Extract locations and sequence from natural language query"""
@@ -180,14 +150,13 @@ async def route_summary(data: OptimizedRouteSummaryRequest):
     try:
         if not data.optimized_route or len(data.optimized_route) < 2:
             raise HTTPException(status_code=400, detail="At least two locations required for summary.")
-        # Prepare readable route string
+
         route_text = " → ".join([loc.name for loc in data.optimized_route])
         total_stops = len(data.optimized_route)
         weather_text = ""
         if data.weather_alerts:
             weather_text = "Weather alerts: " + ", ".join(data.weather_alerts)
 
-        # Optional: include time violations from full_log
         time_violations = []
         for entry in data.full_log or []:
             if entry.get("event") == "Wait" and entry.get("reason"):
@@ -196,7 +165,6 @@ async def route_summary(data: OptimizedRouteSummaryRequest):
         if time_violations:
             time_violation_text = "Time delays due to: " + "; ".join(time_violations)
 
-        # Gemini prompt
         prompt = f"""
         You are an AI Logistics Assistant. Summarize the following delivery route for the driver:
 
@@ -322,10 +290,11 @@ async def agent_chat(message: ChatMessage):
     Chat with AI logistics copilot
     
     Examples:
-    - "I need to deliver from Delhi to Mumbai via Jaipur"
     - "How is the traffic looking right now?"
     - "I'm delayed by 30 minutes due to rain"
     - "What's my current status?"
+    - "Any weather alerts on my route?"
+    - "How long will it take to reach the next stop?"
     """
     try:
         response = run_logistics_chat(user_input=message.message, session_id=message.session_id)
@@ -371,90 +340,19 @@ async def get_agent_status(session_id: str = Query(..., description="Session ID 
         "completed_stops": [stop["name"] for stop in completed],
         "route_details": stops
     }
-
-# @app.post("/agent/report-delay")
-# async def report_delay(delay: DelayReport):
-#     """Report a delay and get agent recommendation"""
-#     if not CURRENT_STATE["is_active"]:
-#         raise HTTPException(
-#             status_code=404,
-#             detail="No active route. Create a manifest first."
-#         )
     
-#     # Use agent to process the delay
-#     message = f"I'm delayed by {delay.delay_minutes} minutes due to {delay.reason}"
-#     if delay.location:
-#         message += f" at {delay.location}"
-    
-#     agent_response = run_logistics_chat(message)
-    
-#     return {
-#         "status": "success",
-#         "delay_recorded": {
-#             "minutes": delay.delay_minutes,
-#             "reason": delay.reason,
-#             "location": delay.location,
-#             "timestamp": datetime.now().isoformat()
-#         },
-#         "agent_recommendation": agent_response
-#     }
-
-# @app.post("/agent/check-traffic")
-# async def check_traffic_status():
-#     """Check real-time traffic for active route"""
-#     if not CURRENT_STATE["is_active"]:
-#         raise HTTPException(
-#             status_code=404,
-#             detail="No active route. Create a manifest first."
-#         )
-    
-#     agent_response = run_logistics_chat("Check traffic conditions for my route")
-    
-#     return {
-#         "status": "success",
-#         "traffic_check": agent_response,
-#         "timestamp": datetime.now().isoformat()
-#     }
-
-@app.get("/traffic/map")
-async def get_traffic_map(session_id: str = Query(...)):
-    """Generate and return traffic visualization map"""
-    state = get_session_state(session_id)
-    if not state["is_active"]:
-        raise HTTPException(status_code=404, detail="No active route found for this session.")
-    
-    try:
-        locations = [{
-            "name": s["name"],
-            "lat": s["lat"],
-            "lon": s["lon"]
-        } for s in state["active_route"]]
-        result = generate_traffic_map(locations, route_sequence=locations)
+@app.get("/traffic/view-map/{filename}")
+async def view_traffic_map(filename: str):
+    """Serve a specific generated traffic map"""
+    if not filename.endswith(".html") or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
         
-        return {
-            "status": "success",
-            "map_file": result["map_file"],
-            "congestion_status": result["congestion_status"],
-            "details": result["details"],
-            "download_url": "/traffic/download-map"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Traffic map generation failed: {str(e)}")
-
-@app.get("/traffic/download-map")
-async def download_traffic_map():
-    """Download the generated traffic map HTML file"""
-    map_file = "traffic_map.html"
+    file_path = filename
     
-    if not os.path.exists(map_file):
-        raise HTTPException(status_code=404, detail="Traffic map not generated yet")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Map not found")
     
-    return FileResponse(
-        map_file,
-        media_type="text/html",
-        filename="traffic_map.html"
-    )
+    return FileResponse(file_path, media_type="text/html")
   
 @app.get("/health")
 async def health_check():
