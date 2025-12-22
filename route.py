@@ -1,337 +1,288 @@
 import os
 import requests
 import random
-import math
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 ORS_API = os.getenv("ORS_API_KEY")
-WEATHER_API = os.getenv("WEATHER_API") 
+WEATHER_API = os.getenv("WEATHER_API")
 
 # CONFIGURATION
 POPULATION_SIZE = 60
 GENERATIONS = 150
 MUTATION_RATE = 0.20
+ALPHA = 1.0
+BETA = 1.5
+SEQUENCE_PENALTY = 1000000
 
-ALPHA = 1.0  # Distance Weight
-BETA  = 1.5  # Time Weight (Time is money, and we might wait for weather)
-SEQUENCE_PENALTY = 1e6  # Massive penalty for breaking user order
-
-# DATA FETCHING: MATRIX & WEATHER
+# DISTANCE MATRIX
 def get_distance_matrix(locations):
-    """
-    Fetches Distance and Duration matrices from OpenRouteService.
-    locations: List of dicts [{'lat': x, 'lon': y}, ...]
-    """
     coords = [[loc['lon'], loc['lat']] for loc in locations]
-    
     url = "https://api.openrouteservice.org/v2/matrix/driving-car"
-    headers = {
-        "Authorization": ORS_API,
-        "Content-Type": "application/json"
-    }
-    body = {
-        "locations": coords,
-        "metrics": ["distance", "duration"]
-    }
+    headers = {"Authorization": ORS_API, "Content-Type": "application/json"}
+    body = {"locations": coords, "metrics": ["distance", "duration"]}
 
     try:
-        response = requests.post(url, json=body, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        r = requests.post(url, json=body, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
         return data["distances"], data["durations"]
     except Exception as e:
         print(f"[route.py] Matrix API Error: {e}")
         return [], []
 
+# WEATHER FETCH (THREADED)
+def _fetch_weather(idx, loc):
+    try:
+        url = "https://api.openweathermap.org/data/2.5/forecast"
+        params = {
+            "lat": loc["lat"],
+            "lon": loc["lon"],
+            "appid": WEATHER_API,
+            "units": "metric"
+        }
+        r = requests.get(url, params=params, timeout=10).json()
+        entries = r.get("list", [])
+        for e in entries:
+            e["_dt"] = datetime.strptime(e["dt_txt"], "%Y-%m-%d %H:%M:%S")
+        return idx, entries
+    except:
+        return idx, []
+
 def fetch_weather_forecasts(locations):
-    """
-    Fetches 5-day/3-hour forecast for all unique locations.
-    Returns a dict: { city_index: [forecast_entries] }
-    """
     forecasts = {}
-    print("[route.py] Fetching weather data for all stops...")
-    
-    for idx, loc in enumerate(locations):
-        try:
-            url = "https://api.openweathermap.org/data/2.5/forecast"
-            params = {
-                "lat": loc['lat'],
-                "lon": loc['lon'],
-                "appid": WEATHER_API,
-                "units": "metric"
-            }
-            res = requests.get(url, params=params).json()
-            
-            if "list" in res:
-                forecasts[idx] = res["list"]
-        except Exception as e:
-            print(f"[route.py] Weather API Error for {loc.get('name', idx)}: {e}")
-            forecasts[idx] = []
-            
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_weather, i, loc) for i, loc in enumerate(locations)]
+        for f in as_completed(futures):
+            idx, data = f.result()
+            forecasts[idx] = data
     return forecasts
 
+# WEATHER CHECK
 def check_weather_at_time(forecast_list, target_datetime):
-    """
-    Checks specific weather conditions for a given time.
-    Returns: (should_wait_bool, wait_seconds, reason_str)
-    """
     if not forecast_list:
         return False, 0, ""
 
-    # 1. Find the best matching forecast slot
-    relevant_entry = None
-    min_diff = float('inf')
+    best = None
+    min_diff = float("inf")
 
-    for entry in forecast_list:
-        dt_txt = entry["dt_txt"] # e.g. "2025-12-17 15:00:00"
-        forecast_time = datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S")
-        
-        # Calculate time difference
-        diff = abs((forecast_time - target_datetime).total_seconds())
-        
+    for e in forecast_list:
+        diff = abs((e["_dt"] - target_datetime).total_seconds())
         if diff < min_diff:
             min_diff = diff
-            relevant_entry = entry
+            best = e
 
-    if not relevant_entry or min_diff > 10800: 
+    if not best or min_diff > 10800:
         return False, 0, ""
-    
-    rain_vol = relevant_entry.get("rain", {}).get("3h", 0) or 0
-    wind_speed = relevant_entry.get("wind", {}).get("speed", 0) or 0
-    visibility = relevant_entry.get("visibility", 10000) or 10000 # Default 10km (clear)
-    
-    reasons = []
-    
-    # Threshold: Moderate/Heavy Rain (> 5mm per 3 hours) causes hydroplaning risk
-    if rain_vol > 5.0: 
-        reasons.append(f"Heavy Rain ({rain_vol}mm)")
 
-    # Threshold: High Wind (> 15 m/s or ~54 km/h) risks toppling high-profile trucks
-    if wind_speed > 15.0: 
-        reasons.append(f"Gale Winds ({wind_speed}m/s)")
-        
-    # Threshold: Low Visibility (< 500m) is dangerous for highway driving
-    if visibility < 1000:
-        reasons.append(f"Fog/Low Visibility ({visibility}m)")
+    rain = best.get("rain", {}).get("3h", 0) or 0
+    wind = best.get("wind", {}).get("speed", 0) or 0
+    vis = best.get("visibility", 10000) or 10000
+
+    reasons = []
+    if rain > 5.0:
+        reasons.append(f"Heavy Rain ({rain}mm)")
+    if wind > 15.0:
+        reasons.append(f"Gale Winds ({wind}m/s)")
+    if vis < 1000:
+        reasons.append(f"Fog/Low Visibility ({vis}m)")
 
     if reasons:
-        # Production Logic: If dangerous, wait 2 hours for conditions to improve
         return True, 7200, ", ".join(reasons)
-    
+
     return False, 0, ""
 
-# GENETIC ALGORITHM CORE
+def get_single_stop_weather(lat, lon, location_name, eta_iso=None):
+    """
+    Fetches fresh weather for a specific location and time.
+    Used by the Agent to check the next stop.
+    """
+    if eta_iso:
+        try:
+            target_time = datetime.fromisoformat(eta_iso)
+        except ValueError:
+            target_time = datetime.now()
+    else:
+        target_time = datetime.now()
+
+    if target_time.tzinfo is not None:
+        target_time = target_time.replace(tzinfo=None)
+    _, entries = _fetch_weather(0, {"lat": lat, "lon": lon})
+    
+    if not entries:
+        return f"Could not fetch weather data for {location_name}."
+
+    best_match = None
+    min_diff = float("inf")
+
+    for entry in entries:
+        diff = abs((entry["_dt"] - target_time).total_seconds())
+        if diff < min_diff:
+            min_diff = diff
+            best_match = entry
+
+    if best_match:
+        desc = best_match.get("weather", [{}])[0].get("description", "Unknown").capitalize()
+        temp = best_match.get("main", {}).get("temp", "N/A")
+        wind = best_match.get("wind", {}).get("speed", 0)
+        rain = best_match.get("rain", {}).get("3h", 0)        
+        arrival_str = target_time.strftime("%H:%M")
+        summary = [
+            f"**Weather for {location_name}** (Arrival ~{arrival_str})",
+            f"Condition: {desc}",
+            f"Temp: {temp}°C",
+            f"Wind: {wind} m/s"
+        ]
+        
+        if rain > 0:
+            summary.append(f"Rain: {rain}mm (Take caution)")
+        
+        return "\n".join(summary)
+    
+    return f"No close forecast found for {location_name} at {target_time}."
+
+# ROUTE METRICS
 def calculate_route_metrics(route, dist_matrix, dur_matrix, forecasts, start_time):
-    """
-    Calculates Distance, Duration (including Waits), and generates a Travel Log.
-    """
     total_dist = 0
-    total_duration = 0
+    total_time = 0
     current_time = start_time
-    
-    travel_log = [] 
-    
-    travel_log.append({
-        "city_idx": route[0],
-        "event": "Depart",
-        "time": current_time,
-        "note": "Trip Start"
-    })
+    travel_log = []
+
+    travel_log.append({"city_idx": route[0], "event": "Depart", "time": current_time, "note": "Trip Start"})
 
     for i in range(len(route) - 1):
-        u = route[i]
-        v = route[i+1]
-        
-        # 1. Travel
-        leg_dist = dist_matrix[u][v]
-        leg_time = dur_matrix[u][v]
-        
-        total_dist += leg_dist
-        total_duration += leg_time
-        current_time += timedelta(seconds=leg_time)
-        
-        # 2. Check Weather at Arrival (City V)
-        should_wait, wait_sec, reason = check_weather_at_time(forecasts.get(v, []), current_time)
-        
-        if should_wait:
-            total_duration += wait_sec
-            wait_end_time = current_time + timedelta(seconds=wait_sec)
-            
+        u, v = route[i], route[i + 1]
+
+        d = dist_matrix[u][v]
+        t = dur_matrix[u][v]
+
+        total_dist += d
+        total_time += t
+        current_time += timedelta(seconds=t)
+
+        wait, wsec, reason = check_weather_at_time(forecasts.get(v, []), current_time)
+        if wait:
+            total_time += wsec
             travel_log.append({
                 "city_idx": v,
                 "event": "Weather Wait",
                 "time": current_time,
-                "duration_sec": wait_sec,
+                "duration_sec": wsec,
                 "note": f"Waiting for {reason}"
             })
-            
-            current_time = wait_end_time 
+            current_time += timedelta(seconds=wsec)
 
-        # Arrival Log
-        travel_log.append({
-            "city_idx": v,
-            "event": "Arrive",
-            "time": current_time,
-            "note": "Stop reached"
-        })
+        travel_log.append({"city_idx": v, "event": "Arrive", "time": current_time, "note": "Stop reached"})
 
-    return total_dist, total_duration, travel_log
+    return total_dist, total_time, travel_log
 
+# SEQUENCE CHECK
 def check_sequence_violations(route, constraints):
-    """
-    Ensures user's requested order is respected.
-    """
+    seq = {i: c.get("visit_sequence", 2) for i, c in enumerate(constraints)}
     violations = 0
-    # Map index in original list -> required sequence number
-    seq_map = {i: meta.get('visit_sequence', 2) for i, meta in enumerate(constraints)}
-    
-    # Check every pair
     for i in range(len(route)):
         for j in range(i + 1, len(route)):
-            idx_a = route[i]
-            idx_b = route[j]
-            
-            seq_a = seq_map.get(idx_a, 2)
-            seq_b = seq_map.get(idx_b, 2)
-            
-            # If A is strictly higher sequence than B, but A comes first -> Violation
-            if seq_a > seq_b:
+            if seq[route[i]] > seq[route[j]]:
                 violations += 1
     return violations
 
+# COST CACHE
+cost_cache = {}
 def cost_function(route, dist_matrix, dur_matrix, forecasts, constraints, start_time):
-    # Calculate physical metrics (including weather waits)
-    dist, time_with_waits, _ = calculate_route_metrics(route, dist_matrix, dur_matrix, forecasts, start_time)
-    
-    # Calculate constraints
-    seq_violations = check_sequence_violations(route, constraints)
-    
-    # Total Cost
-    # Note: We penalize time heavily so it avoids waiting unless distance detour is huge
-    cost = (ALPHA * dist) + (BETA * time_with_waits) + (seq_violations * SEQUENCE_PENALTY)
+    key = tuple(route)
+    if key in cost_cache:
+        return cost_cache[key]
+
+    dist, t, _ = calculate_route_metrics(route, dist_matrix, dur_matrix, forecasts, start_time)
+    violations = check_sequence_violations(route, constraints)
+
+    cost = (ALPHA * dist) + (BETA * t) + (violations * SEQUENCE_PENALTY)
+    cost_cache[key] = cost
     return cost
 
-# GA HELPERS
-def create_initial_population(num_cities, source_index=0):
-    population = []
-    remaining = list(range(num_cities))
-    remaining.remove(source_index)
+def create_initial_population(n, src=0):
+    base = list(range(n))
+    base.remove(src)
+    return [[src] + random.sample(base, len(base)) for _ in range(POPULATION_SIZE)]
 
-    for _ in range(POPULATION_SIZE):
-        random.shuffle(remaining)
-        population.append([source_index] + remaining[:])
-    return population
+def tournament_selection(pop, *args):
+    cand = random.sample(pop, 3)
+    cand.sort(key=lambda r: cost_function(r, *args))
+    return cand[0]
 
-def tournament_selection(population, dist_mat, dur_mat, forecasts, constraints, start_time):
-    selected = random.sample(population, 3)
-    selected.sort(key=lambda r: cost_function(r, dist_mat, dur_mat, forecasts, constraints, start_time))
-    return selected[0]
-
-def crossover(parent1, parent2):
-    # Order Crossover (OX1) to preserve cities
-    p1 = parent1[1:]
-    p2 = parent2[1:]
-    n = len(p1)
-    a, b = sorted(random.sample(range(n), 2))
-    
-    child_p = [None] * n
-    child_p[a:b] = p1[a:b]
-    
-    idx = b
-    for item in p2:
-        if item not in child_p:
-            if idx >= n: idx = 0
-            child_p[idx] = item
+def crossover(p1, p2):
+    a, b = sorted(random.sample(range(1, len(p1)), 2))
+    child = [None] * len(p1)
+    child[0] = p1[0]
+    child[a:b] = p1[a:b]
+    fill = [x for x in p2 if x not in child]
+    idx = 1
+    for x in fill:
+        while child[idx] is not None:
             idx += 1
-            
-    return [parent1[0]] + child_p
+        child[idx] = x
+    return child
 
 def mutate(route):
     if random.random() < MUTATION_RATE:
-        idx_range = range(1, len(route))
-        if len(idx_range) >= 2:
-            a, b = random.sample(idx_range, 2)
-            route[a], route[b] = route[b], route[a]
+        a, b = random.sample(range(1, len(route)), 2)
+        route[a], route[b] = route[b], route[a]
     return route
 
-# Main GA route optimization function
 def solve_route(locations_data):
-    """
-    Main function called by the Agent.
-    locations_data: List of dicts [{'name', 'lat', 'lon', 'visit_sequence'}]
-    """
-    if not locations_data or len(locations_data) < 2:
+    if len(locations_data) < 2:
         return {"status": "error", "message": "Need at least 2 locations."}
 
-    # 1. Fetch Static Data
     dist_matrix, dur_matrix = get_distance_matrix(locations_data)
     if not dist_matrix:
         return {"status": "error", "message": "Failed to fetch Matrix API."}
 
     forecasts = fetch_weather_forecasts(locations_data)
-    
-    # 2. Setup GA
     start_time = datetime.now()
     population = create_initial_population(len(locations_data))
-    
-    global_best = None
-    global_best_cost = float('inf')
 
-    # 3. Evolution Loop
-    for gen in range(GENERATIONS):
-        new_pop = []
-        
-        # Elitism
-        population.sort(key=lambda r: cost_function(r, dist_matrix, dur_matrix, forecasts, locations_data, start_time))
-        new_pop.extend(population[:2])
-        
+    best = None
+    best_cost = float("inf")
+
+    for _ in range(GENERATIONS):
+        population.sort(key=lambda r: cost_function(
+            r, dist_matrix, dur_matrix, forecasts, locations_data, start_time
+        ))
+        new_pop = population[:2]
+
         while len(new_pop) < POPULATION_SIZE:
             p1 = tournament_selection(population, dist_matrix, dur_matrix, forecasts, locations_data, start_time)
             p2 = tournament_selection(population, dist_matrix, dur_matrix, forecasts, locations_data, start_time)
-            child = mutate(crossover(p1, p2))
-            new_pop.append(child)
-            
-        population = new_pop
-        
-        # Track Best
-        curr_best = population[0]
-        curr_cost = cost_function(curr_best, dist_matrix, dur_matrix, forecasts, locations_data, start_time)
-        if curr_cost < global_best_cost:
-            global_best = curr_best
-            global_best_cost = curr_cost
+            new_pop.append(mutate(crossover(p1, p2)))
 
-    # 4. Final Calculation & Formatting
-    final_dist, final_sec, travel_log = calculate_route_metrics(
-        global_best, dist_matrix, dur_matrix, forecasts, start_time
-    )
-    
-    # Format the route for the Agent
-    optimized_route_names = []
-    weather_alerts = []
-    
-    for event in travel_log:
-        city_name = locations_data[event['city_idx']]['name']
-        
-        if event['event'] == 'Weather Wait':
-            weather_alerts.append(f"Wait at {city_name} for {int(event['duration_sec']/3600)}h due to {event['note']}")
-        
-        if event['event'] == 'Arrive':
-             # Only add unique cities to the list path
-            if not optimized_route_names or optimized_route_names[-1] != city_name:
-                optimized_route_names.append(city_name)
-    
-    # Insert Source at start if missing
-    source_name = locations_data[global_best[0]]['name']
-    if optimized_route_names[0] != source_name:
-        optimized_route_names.insert(0, source_name)
+        population = new_pop
+
+        if cost_function(population[0], dist_matrix, dur_matrix, forecasts, locations_data, start_time) < best_cost:
+            best = population[0]
+            best_cost = cost_function(best, dist_matrix, dur_matrix, forecasts, locations_data, start_time)
+
+    dist, sec, log = calculate_route_metrics(best, dist_matrix, dur_matrix, forecasts, start_time)
+
+    route_names = []
+    alerts = []
+
+    for e in log:
+        name = locations_data[e["city_idx"]]["name"]
+        if e["event"] == "Weather Wait":
+            alerts.append(f"Wait at {name} for {int(e['duration_sec']/3600)}h due to {e['note']}")
+        if e["event"] == "Arrive" and (not route_names or route_names[-1] != name):
+            route_names.append(name)
+
+    if route_names[0] != locations_data[best[0]]["name"]:
+        route_names.insert(0, locations_data[best[0]]["name"])
 
     return {
         "status": "success",
-        "total_distance_km": round(final_dist / 1000, 2),
-        "total_duration_hours": round(final_sec / 3600, 2),
-        "optimized_route": optimized_route_names,
-        "weather_alerts": weather_alerts,
-        "full_log": travel_log  
+        "total_distance_km": round(dist / 1000, 2),
+        "total_duration_hours": round(sec / 3600, 2),
+        "optimized_route": route_names,
+        "weather_alerts": alerts,
+        "full_log": log
     }
